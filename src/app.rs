@@ -1423,7 +1423,19 @@ impl App {
         if job.name.trim().is_empty() {
             job.name = tr!("Auftrag {}", "Job {}", job.id);
         }
-        let job = job.clone();
+        // "Beim Anstecken": jetzt die Laufwerke der Ziele kennenlernen, um sie später
+        // wiederzuerkennen. Sind sie nicht da, wird nichts gespeichert.
+        let wanted = self.cfg.jobs[index].clone();
+        let plug = (wanted.schedule == ScheduleKind::Plugged).then(|| jobs::plug_targets_now(&wanted, &self.cfg));
+        let job = match plug {
+            Some(Err(message)) => return self.fail(message),
+            Some(Ok(found)) => {
+                let job = &mut self.cfg.jobs[index];
+                job.plug_targets = found;
+                job.clone()
+            }
+            None => self.cfg.jobs[index].clone(),
+        };
         self.persist();
         if self.no_save() {
             return self.set_result(
@@ -1441,6 +1453,16 @@ impl App {
                     t!(
                         "Auftrag gespeichert\nEr läuft nur, wenn du ihn von Hand startest.",
                         "Job saved\nIt only runs when you start it manually."
+                    ),
+                );
+            }
+            Ok(()) if job.schedule == ScheduleKind::Plugged => {
+                self.set_result(
+                    Level::Ok,
+                    tr!(
+                        "Auftrag gespeichert\nEr sichert, sobald das Ziel angesteckt ist – spätestens {} Minuten danach. ZEBack erkennt das Laufwerk wieder, auch wenn Windows ihm einen anderen Buchstaben gibt.",
+                        "Job saved\nIt backs up as soon as the target is plugged in – {} minutes later at most. ZEBack recognises the drive even if Windows gives it a different letter.",
+                        schedule::PLUG_CHECK_MINUTES
                     ),
                 );
             }
@@ -1469,6 +1491,7 @@ impl App {
             if let Some(state) = jobs::state_path(job.id) {
                 let _ = std::fs::remove_file(state);
             }
+            jobs::forget_plug_state(job.id);
             if let Err(e) = schedule::remove(job.id) {
                 self.push_log(true, format!("{e:#}"));
             }
@@ -5096,15 +5119,29 @@ impl App {
                         (ScheduleKind::Off, t!("Aus", "Off")),
                         (ScheduleKind::Daily, t!("Täglich", "Daily")),
                         (ScheduleKind::Weekly, t!("Wöchentlich", "Weekly")),
+                        (ScheduleKind::Plugged, t!("Anstecken", "Plug-in")),
                     ],
                 );
+                if job.schedule == ScheduleKind::Plugged {
+                    ui.add_space(4.0);
+                    widgets::text(
+                        ui,
+                        tr!(
+                            "Sichert, sobald das Ziel angesteckt ist, zum Beispiel die USB-Festplatte. ZEBack schaut alle {} Minuten nach. Bleibt das Ziel dran, wird einmal am Tag gesichert. Beim Speichern muss es angesteckt sein.",
+                            "Backs up as soon as the target is plugged in, for example the USB hard drive. ZEBack checks every {} minutes. If the target stays plugged in, it backs up once a day. It must be plugged in when you save.",
+                            schedule::PLUG_CHECK_MINUTES
+                        ),
+                        theme::regular(12.0),
+                        TEXT_MUTED,
+                    );
+                }
                 if job.schedule == ScheduleKind::Weekly {
                     ui.add_space(4.0);
                     let days: Vec<(u8, &str)> =
                         config::weekdays().iter().enumerate().map(|(day, name)| (day as u8, *name)).collect();
                     widgets::segmented(ui, "weekday", &mut job.weekday, &days);
                 }
-                if job.schedule != ScheduleKind::Off {
+                if matches!(job.schedule, ScheduleKind::Daily | ScheduleKind::Weekly) {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         widgets::text(ui, t!("um", "at"), theme::regular(13.0), TEXT_MUTED);

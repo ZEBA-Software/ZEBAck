@@ -67,6 +67,8 @@ fn main() -> eframe::Result {
     config::Config::adopt_previous();
     i18n::apply(config::Config::load().language);
     match job_to_run(&args) {
+        // Zeitplan "Beim Anstecken": nur sichern, wenn das Ziel gerade da ist.
+        Some(Ok(id)) if args.iter().any(|arg| arg == "--if-plugged") => std::process::exit(jobs::run_if_plugged(id)),
         Some(Ok(id)) => std::process::exit(jobs::run_headless(id)),
         Some(Err(message)) => {
             eprintln!("{message}");

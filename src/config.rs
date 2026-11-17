@@ -205,6 +205,16 @@ pub enum ScheduleKind {
     Off,
     Daily,
     Weekly,
+    /// Sobald das Ziel angesteckt ist (z. B. die USB-Festplatte); bleibt es dran, einmal am Tag
+    Plugged,
+}
+
+/// Ein Ziel, auf dessen Anstecken ein Auftrag wartet: Das Laufwerk wird an seiner Seriennummer
+/// wiedererkannt, auch wenn Windows ihm einen anderen Buchstaben gibt.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlugTarget {
+    pub target_id: u64,
+    pub serial: u32,
 }
 
 /// Kurznamen der Wochentage in der eingestellten Sprache, beginnend mit Montag.
@@ -254,6 +264,8 @@ pub struct SavedJob {
     /// Wann der Auftrag angelegt wurde, z. B. `10.11.2026 14:30`. Daran misst sich, ob ein
     /// Auftrag überfällig ist, der noch nie gelaufen ist. Leer bei Aufträgen aus Versionen vor 0.20.
     pub created: String,
+    /// Zeitplan "Beim Anstecken": die Ziele auf Datenträgern, die dafür da sein müssen.
+    pub plug_targets: Vec<PlugTarget>,
 }
 
 impl Default for SavedJob {
@@ -277,6 +289,7 @@ impl Default for SavedJob {
             hour: 12,
             minute: 0,
             created: String::new(),
+            plug_targets: Vec::new(),
         }
     }
 }
@@ -294,6 +307,7 @@ impl SavedJob {
             ScheduleKind::Off => t!("nur von Hand", "manual only").to_string(),
             ScheduleKind::Daily => tr!("täglich {time}", "daily {time}"),
             ScheduleKind::Weekly => format!("{} {time}", weekdays()[usize::from(self.weekday.min(6))]),
+            ScheduleKind::Plugged => t!("beim Anstecken", "when plugged in").to_string(),
         }
     }
 }

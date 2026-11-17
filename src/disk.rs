@@ -78,6 +78,62 @@ fn volume_names(root: &[u16]) -> Option<(String, String)> {
     ok.then(|| (from_wide(&label), from_wide(&file_system)))
 }
 
+/// Seriennummer des Volumes mit dieser Wurzel (z. B. `E:\`). Sie gehört zum Datenträger, nicht
+/// zum Laufwerksbuchstaben – daran lässt sich eine USB-Festplatte wiedererkennen.
+#[cfg(windows)]
+pub fn volume_serial(root: &str) -> Option<u32> {
+    use std::ptr::null_mut;
+    let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+    let mut serial = 0u32;
+    // SAFETY: `wide` ist nullterminiert; `serial` ist eine gültige lokale Variable, die übrigen
+    // Angaben werden nicht abgefragt.
+    let ok = unsafe {
+        ffi::GetVolumeInformationW(wide.as_ptr(), null_mut(), 0, &mut serial, null_mut(), null_mut(), null_mut(), 0) != 0
+    };
+    ok.then_some(serial)
+}
+
+#[cfg(not(windows))]
+pub fn volume_serial(_root: &str) -> Option<u32> {
+    None
+}
+
+/// Wurzeln aller Laufwerke (`C:\`, `E:\`, …), deren Volume diese Seriennummer hat. Netz- und
+/// CD-Laufwerke bleiben außen vor.
+#[cfg(windows)]
+pub fn roots_with_serial(serial: u32) -> Vec<String> {
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    // SAFETY: Aufruf ohne Parameter.
+    let mask = unsafe { ffi::GetLogicalDrives() };
+    (0..26u8)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .map(|bit| format!("{}:\\", (b'A' + bit) as char))
+        .filter(|root| {
+            let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: `wide` ist nullterminiert.
+            let kind = unsafe { ffi::GetDriveTypeW(wide.as_ptr()) };
+            (kind == DRIVE_REMOVABLE || kind == DRIVE_FIXED) && volume_serial(root) == Some(serial)
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn roots_with_serial(_serial: u32) -> Vec<String> {
+    Vec::new()
+}
+
+/// Laufwerkswurzel eines Pfads der Form `E:\Ordner` als `E:\` und der Rest dahinter (`Ordner`).
+/// `None` bei Netzwerkpfaden und allem anderen ohne Laufwerksbuchstaben.
+pub fn split_drive(path: &str) -> Option<(String, &str)> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let rest = path[2..].trim_start_matches(['\\', '/']);
+        return Some((format!("{}:\\", bytes[0].to_ascii_uppercase() as char), rest));
+    }
+    None
+}
+
 /// Fragt Windows nach Platz und Dateisystem. Blockiert, bis die Antwort da ist.
 #[cfg(windows)]
 pub fn info(path: &Path) -> Option<DiskInfo> {

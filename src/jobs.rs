@@ -536,6 +536,8 @@ pub fn overdue_after_days(schedule: config::ScheduleKind) -> i64 {
     match schedule {
         config::ScheduleKind::Daily => 3,
         config::ScheduleKind::Weekly => 9,
+        // Beim Anstecken gibt es keinen festen Abstand: nach zwei Wochen ohne Sicherung erinnern.
+        config::ScheduleKind::Plugged => 14,
         config::ScheduleKind::Off => 30,
     }
 }
@@ -614,7 +616,135 @@ fn record(entry: RunRecord) {
 /// Führt den Auftrag mit dieser Kennung ohne Fenster aus (für den Zeitplan und für Skripte).
 /// Rückgabe ist der Beendigungscode des Programms: 0 = gelungen.
 pub fn run_headless(job_id: u64) -> i32 {
-    let cfg = Config::load();
+    run_headless_with(Config::load(), job_id)
+}
+
+// ---------------------------------------------------------------------------- Beim Anstecken
+
+/// Was sich ein Auftrag mit dem Zeitplan "Beim Anstecken" zwischen zwei Prüfungen merkt.
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+struct PlugState {
+    /// War das Ziel bei der letzten Prüfung da?
+    present: bool,
+    /// Wann zuletzt deswegen gesichert wurde, z. B. `10.11.2026 14:30`
+    last_run: String,
+}
+
+fn plug_state_path(job_id: u64) -> Option<PathBuf> {
+    Some(Config::data_dir()?.join("staende").join(format!("anstecken-{job_id}.json")))
+}
+
+/// Entfernt, was sich der Auftrag zum Anstecken gemerkt hat (beim Löschen des Auftrags).
+pub fn forget_plug_state(job_id: u64) {
+    if let Some(path) = plug_state_path(job_id) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Die Ziele eines Auftrags, auf deren Anstecken er wartet – so wie sie jetzt gerade erreichbar
+/// sind. `Err` nennt, was fehlt. Dient beim Speichern dazu, die Laufwerke kennenzulernen.
+pub fn plug_targets_now(job: &SavedJob, cfg: &Config) -> Result<Vec<config::PlugTarget>, String> {
+    let mut found = Vec::new();
+    for target in cfg.targets.iter().filter(|t| job.target_ids.contains(&t.id) && t.kind == TargetKind::Local) {
+        let serial = crate::disk::split_drive(target.path.trim()).and_then(|(root, _)| crate::disk::volume_serial(&root));
+        match serial {
+            Some(serial) => found.push(config::PlugTarget { target_id: target.id, serial }),
+            None => {
+                return Err(tr!(
+                    "„{}“ ist nicht angesteckt\nStecke das Ziel jetzt an und speichere noch einmal. So lernt ZEBack das Laufwerk kennen und erkennt es später wieder.",
+                    "“{}” is not plugged in\nPlug the target in now and save again. That is how ZEBack gets to know the drive and recognises it later.",
+                    target.name
+                ));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(t!(
+            "Kein Ziel zum Anstecken\nDieser Auftrag sichert auf kein Ziel der Art „Ordner / USB“. Nur so ein Ziel kann angesteckt werden.",
+            "No target to plug in\nThis job does not back up to a target of the kind “Folder / USB”. Only such a target can be plugged in."
+        )
+        .to_string());
+    }
+    Ok(found)
+}
+
+/// Sind alle Ziele da, auf die der Auftrag wartet? Dann die Ordner, unter denen sie jetzt
+/// erreichbar sind (Kennung des Ziels → Pfad). Hat Windows dem Laufwerk einen anderen Buchstaben
+/// gegeben, zählt es nur, wenn der Zielordner dort schon liegt – sonst würde auf einem fremden
+/// Datenträger ein neuer Ordner entstehen.
+fn plugged_paths(job: &SavedJob, cfg: &Config) -> Option<Vec<(u64, String)>> {
+    if job.plug_targets.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for wanted in &job.plug_targets {
+        let target = cfg.targets.iter().find(|t| t.id == wanted.target_id && t.kind == TargetKind::Local)?;
+        let path = target.path.trim();
+        let (root, rest) = crate::disk::split_drive(path)?;
+        if crate::disk::volume_serial(&root) == Some(wanted.serial) {
+            paths.push((target.id, path.to_string()));
+            continue;
+        }
+        let moved = crate::disk::roots_with_serial(wanted.serial)
+            .into_iter()
+            .map(|other| format!("{other}{rest}"))
+            .find(|candidate| !rest.is_empty() && std::path::Path::new(candidate).is_dir())?;
+        paths.push((target.id, moved));
+    }
+    Some(paths)
+}
+
+/// Soll jetzt gesichert werden? Ja, wenn das Ziel gerade erst angesteckt wurde – oder wenn es
+/// dran geblieben ist und die letzte Sicherung deswegen mindestens einen Tag her ist.
+fn plug_due(state: &PlugState, now: NaiveDateTime) -> bool {
+    if !state.present {
+        return true;
+    }
+    match NaiveDateTime::parse_from_str(&state.last_run, STAMP) {
+        Ok(last) => (now - last).num_hours() >= 24,
+        Err(_) => true,
+    }
+}
+
+/// Zeitplan "Beim Anstecken": Die Aufgabenplanung ruft das alle paar Minuten auf. Ist das Ziel
+/// nicht da, passiert nichts (kein Protokoll, kein Eintrag im Verlauf). Rückgabe wie bei
+/// [`run_headless`].
+pub fn run_if_plugged(job_id: u64) -> i32 {
+    let mut cfg = Config::load();
+    // Den Auftrag gibt es nicht mehr: still beenden, sonst käme die Meldung alle paar Minuten.
+    let Some(saved) = cfg.jobs.iter().find(|j| j.id == job_id).cloned() else { return 2 };
+    let Some(state_file) = plug_state_path(job_id) else { return 2 };
+    let state: PlugState =
+        fs::read_to_string(&state_file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    let remember = |state: &PlugState| {
+        if let Some(dir) = state_file.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(&state_file, serde_json::to_string(state).unwrap_or_default());
+    };
+
+    let Some(paths) = plugged_paths(&saved, &cfg) else {
+        if state.present {
+            remember(&PlugState { present: false, last_run: state.last_run });
+        }
+        return 0;
+    };
+    if !plug_due(&state, Local::now().naive_local()) {
+        return 0;
+    }
+    // Vor dem Lauf merken: Schlägt er fehl, soll er nicht alle paar Minuten neu starten, sondern
+    // erst beim nächsten Anstecken oder am nächsten Tag.
+    remember(&PlugState { present: true, last_run: now_stamp() });
+    // Steckt das Laufwerk unter einem anderen Buchstaben, gilt für diesen Lauf der neue Pfad.
+    for (target_id, path) in paths {
+        if let Some(target) = cfg.targets.iter_mut().find(|t| t.id == target_id) {
+            target.path = path;
+        }
+    }
+    run_headless_with(cfg, job_id)
+}
+
+fn run_headless_with(cfg: Config, job_id: u64) -> i32 {
     let log_file = log_path(job_id);
     if let Some(dir) = log_file.as_ref().and_then(|p| p.parent()) {
         let _ = fs::create_dir_all(dir);
@@ -875,6 +1005,70 @@ mod tests {
         let (_, body) = report_text("Auftrag 2", true, "ok", &[], &all);
         assert!(body.contains("Achtung, überfällig:\n- „Auftrag 1“: letzte gelungene Sicherung vor 6 Tagen.\n"), "{body}");
         assert!(!report_text("Auftrag 2", true, "ok", &[], &[]).1.contains("überfällig"));
+    }
+
+    #[test]
+    fn plugged_in_jobs_run_once_per_plug_in_and_once_a_day() {
+        let at = |text: &str| NaiveDateTime::parse_from_str(text, STAMP).unwrap();
+        let state = |present: bool, last_run: &str| PlugState { present, last_run: last_run.into() };
+        // Gerade angesteckt (vorher nicht da): sichern, auch wenn heute schon gesichert wurde.
+        assert!(plug_due(&state(false, ""), at("17.11.2026 10:00")));
+        assert!(plug_due(&state(false, "17.11.2026 09:00"), at("17.11.2026 10:00")));
+        // Bleibt es dran: erst nach einem Tag wieder.
+        assert!(!plug_due(&state(true, "17.11.2026 09:00"), at("17.11.2026 10:00")));
+        assert!(!plug_due(&state(true, "17.11.2026 09:00"), at("18.11.2026 08:59")));
+        assert!(plug_due(&state(true, "17.11.2026 09:00"), at("18.11.2026 09:00")));
+        assert!(plug_due(&state(true, "unlesbar"), at("17.11.2026 10:00")));
+
+        assert_eq!(crate::disk::split_drive("e:\\Backups\\PC"), Some(("E:\\".to_string(), "Backups\\PC")));
+        assert_eq!(crate::disk::split_drive("E:"), Some(("E:\\".to_string(), "")));
+        assert_eq!(crate::disk::split_drive("\\\\nas\\backup"), None);
+    }
+
+    /// Mit den echten Laufwerken dieses PCs: Das Ziel wird an der Seriennummer seines Laufwerks
+    /// erkannt; ein Auftrag ohne Ordner-Ziel oder mit fehlendem Laufwerk wartet auf nichts.
+    #[cfg(windows)]
+    #[test]
+    fn recognises_the_target_drive_by_its_serial_number() {
+        let base = temp_dir("anstecken");
+        let folder = base.join("ziel");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.to_string_lossy().into_owned();
+        let (root, rest) = crate::disk::split_drive(&path).unwrap();
+        let serial = crate::disk::volume_serial(&root).expect("Seriennummer des Laufwerks");
+        assert!(crate::disk::roots_with_serial(serial).contains(&root));
+
+        let mut cfg = Config::default();
+        cfg.targets.push(Target { id: 1, name: "USB".into(), kind: TargetKind::Local, path: path.clone(), ..Target::default() });
+        cfg.targets.push(Target { id: 2, name: "Wolke".into(), kind: TargetKind::Nextcloud, ..Target::default() });
+        let mut job = SavedJob { id: 5, target_ids: vec![1, 2], ..SavedJob::default() };
+
+        // Beim Speichern lernt der Auftrag das Laufwerk kennen – nur Ordner-Ziele zählen.
+        let known = plug_targets_now(&job, &cfg).unwrap();
+        assert_eq!(known, [config::PlugTarget { target_id: 1, serial }]);
+        assert_eq!(plugged_paths(&job, &cfg), None, "ohne gemerkte Laufwerke wartet der Auftrag auf nichts");
+        job.plug_targets = known;
+        assert_eq!(plugged_paths(&job, &cfg), Some(vec![(1, path.clone())]));
+
+        // Anderer Buchstabe, den es nicht gibt: Das Laufwerk wird über die Seriennummer gefunden,
+        // weil der Zielordner dort liegt.
+        let free = ('D'..='Z').rev().map(|c| format!("{c}:\\")).find(|r| crate::disk::volume_serial(r).is_none()).unwrap();
+        cfg.targets[0].path = format!("{free}{rest}");
+        assert_eq!(plugged_paths(&job, &cfg), Some(vec![(1, format!("{root}{rest}"))]));
+        // Fehlt dort der Ordner, gilt das Ziel als nicht angesteckt …
+        cfg.targets[0].path = format!("{free}gibt-es-nicht-{}", std::process::id());
+        assert_eq!(plugged_paths(&job, &cfg), None);
+        // … genauso bei einer fremden Seriennummer.
+        cfg.targets[0].path = path;
+        job.plug_targets[0].serial = serial.wrapping_add(1);
+        assert_eq!(plugged_paths(&job, &cfg), None);
+
+        // Ohne Ordner-Ziel oder mit fehlendem Laufwerk lässt sich so ein Auftrag nicht speichern.
+        let only_cloud = SavedJob { target_ids: vec![2], ..SavedJob::default() };
+        assert!(plug_targets_now(&only_cloud, &cfg).unwrap_err().starts_with("Kein Ziel zum Anstecken"));
+        cfg.targets[0].path = format!("{free}Backups");
+        assert!(plug_targets_now(&job, &cfg).unwrap_err().starts_with("„USB“ ist nicht angesteckt"));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

@@ -58,6 +58,8 @@ new version and installs it with one click.
 **Automatically**
 
 - **Jobs** remember what is backed up where, and run with one click or on a **schedule**
+- **Back up when plugged in** – a job can start by itself as soon as its USB drive is connected;
+  ZEBack recognises the drive even if Windows gives it a different letter
 - **Back up changes only** saves time and space
 - Old backups are **cleaned up** if you want
 - **Reports** by email or Windows notification when something goes wrong
@@ -209,8 +211,8 @@ creates the installers from the existing EXE files.
 2. Create a tag with the same number and push it:
 
    ```powershell
-   git tag v0.20.1
-   git push origin v0.20.1
+   git tag v0.21.0
+   git push origin v0.21.0
    ```
 
 GitHub does the rest (`.github/workflows/release.yml`): it builds both architectures, creates the

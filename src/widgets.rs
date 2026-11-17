@@ -532,16 +532,39 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, salt: &str, value: &mut T, op
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
     let id = ui.make_persistent_id(salt);
     let inner = rect.shrink(3.0);
-    let cell = inner.width() / options.len().max(1) as f32;
-    let segment = |index: usize| {
-        Rect::from_min_size(pos2(inner.left() + cell * index as f32, inner.top()), vec2(cell, inner.height()))
+    let count = options.len().max(1) as f32;
+    const PADDING: f32 = 8.0;
+    // Gleich breite Felder – außer ein Text passt so nicht hinein: Dann bekommt jedes Feld die
+    // Breite seines Textes und der Rest wird gleichmäßig verteilt (kurze Wörter geben Platz ab).
+    let equal = inner.width() / count;
+    let texts: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| ui.painter().layout_no_wrap((*label).to_owned(), theme::regular(13.0), TEXT).size().x)
+        .collect();
+    let needed: f32 = texts.iter().map(|width| width + PADDING).sum();
+    let cells: Vec<f32> = if texts.iter().all(|width| *width <= equal - PADDING) || needed > inner.width() {
+        vec![equal; options.len()]
+    } else {
+        let spare = (inner.width() - needed) / count;
+        texts.iter().map(|width| width + PADDING + spare).collect()
     };
+    let lefts: Vec<f32> = cells
+        .iter()
+        .scan(0.0, |sum, width| {
+            let left = *sum;
+            *sum += width;
+            Some(left)
+        })
+        .collect();
+    let segment =
+        |index: usize| Rect::from_min_size(pos2(inner.left() + lefts[index], inner.top()), vec2(cells[index], inner.height()));
 
     let painter = ui.painter().clone();
     painter.rect(rect, CornerRadius::same(4), BG, Stroke::new(1.0, BORDER), StrokeKind::Inside);
     if let Some(index) = options.iter().position(|(v, _)| v == value) {
-        let left = ui.ctx().animate_value_with_time(id.with("left"), cell * index as f32, 0.16);
-        let highlight = Rect::from_min_size(pos2(inner.left() + left, inner.top()), vec2(cell, inner.height()));
+        let left = ui.ctx().animate_value_with_time(id.with("left"), lefts[index], 0.16);
+        let width = ui.ctx().animate_value_with_time(id.with("width"), cells[index], 0.16);
+        let highlight = Rect::from_min_size(pos2(inner.left() + left, inner.top()), vec2(width, inner.height()));
         painter.rect(highlight, CornerRadius::same(3), ACCENT_BG, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
     }
     for (index, (option, label)) in options.iter().enumerate() {
@@ -554,7 +577,7 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, salt: &str, value: &mut T, op
         let selected = ui.ctx().animate_bool_with_time(id.with(("selected", index)), option == value, 0.16);
         let hover = ui.ctx().animate_bool_with_time(id.with(("hover", index)), response.hovered(), 0.1);
         let color = mix(mix(TEXT_MUTED, TEXT, hover), ACCENT_HI, selected);
-        let galley = elided(ui, label, theme::regular(13.0), color, cell - 8.0);
+        let galley = elided(ui, label, theme::regular(13.0), color, cells[index] - PADDING);
         painter.galley(segment(index).center() - galley.size() / 2.0, galley, color);
     }
 }
