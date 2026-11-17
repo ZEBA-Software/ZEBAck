@@ -484,6 +484,7 @@ impl App {
         };
         app.reload_std_rows();
         app.refresh_drives();
+        app.check_overdue_at_start();
 
         // Beim Neustart mit Administratorrechten wird die gewählte Sicherungsart mitgegeben.
         for argument in std::env::args().skip(1) {
@@ -1293,6 +1294,7 @@ impl App {
             skip_online_only: self.cfg.skip_online_only,
             verify: self.cfg.verify_after_backup,
             encrypt: password.is_some(),
+            created: jobs::now_stamp(),
             ..SavedJob::default()
         };
         // Ein Auftrag soll ohne Nachfrage laufen können: sein Verschlüsselungs-Passwort kommt
@@ -1315,6 +1317,38 @@ impl App {
                 "Job saved\nHere you set how often it runs and how many backups are kept."
             ),
         );
+    }
+
+    /// Aufträge, deren letzte gelungene Sicherung zu lange her ist.
+    fn overdue_jobs(&self) -> Vec<jobs::Overdue> {
+        jobs::overdue_jobs(&self.cfg.jobs, &self.history, Local::now().naive_local())
+    }
+
+    /// Beim Start: Aufträge aus älteren Versionen bekommen ihr Anlegedatum (ab jetzt wird
+    /// mitgezählt), und überfällige Aufträge werden gemeldet.
+    fn check_overdue_at_start(&mut self) {
+        let mut dated = false;
+        for job in self.cfg.jobs.iter_mut().filter(|job| job.created.is_empty()) {
+            job.created = jobs::now_stamp();
+            dated = true;
+        }
+        if dated {
+            self.persist();
+        }
+        let overdue = self.overdue_jobs();
+        if overdue.is_empty() {
+            return;
+        }
+        let mut text = t!("Sicherung überfällig", "Backup overdue").to_string();
+        for job in &overdue {
+            text.push('\n');
+            text.push_str(&job.text());
+        }
+        text.push_str(t!(
+            "\nUnter „Aufträge“ kannst du sie gleich starten.",
+            "\nYou can start it right away under “Jobs”."
+        ));
+        self.set_result(Level::Warn, text);
     }
 
     /// Entwicklungs-Builds: Bei Testläufen nichts dauerhaft speichern.
@@ -1371,6 +1405,7 @@ impl App {
                     "Wenn du das liest, funktioniert der E-Mail-Bericht von ZEBack.",
                     "If you are reading this, ZEBack's email report is working."
                 ),
+                &[],
                 &[],
             );
             crate::mail::send(&mail, &subject, &body)?;
@@ -2265,6 +2300,7 @@ impl App {
             (Tab::Log, Icon::Log, t!("Protokoll", "Log"), None),
         ];
         let mut clicked = None;
+        let overdue_count = self.overdue_jobs().len();
         ui.scope_builder(egui::UiBuilder::new().max_rect(nav), |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let marker = ui.painter().add(Shape::Noop);
@@ -2279,7 +2315,12 @@ impl App {
                         widgets::nav_group(ui, group, compact);
                     }
                 }
-                let badge = (tab == Tab::Log).then_some(self.unseen_warnings);
+                let badge = match tab {
+                    Tab::Log => Some(self.unseen_warnings),
+                    // Überfällige Aufträge bleiben sichtbar, bis sie wieder gesichert haben.
+                    Tab::Jobs => Some(overdue_count),
+                    _ => None,
+                };
                 let response = widgets::nav_item(ui, self.tab == tab, icon, label, badge, compact);
                 if response.clicked() {
                     clicked = Some(tab);
@@ -4939,16 +4980,24 @@ impl App {
                     TEXT,
                 );
             }
+            let overdue = self.overdue_jobs();
             for (index, job) in self.cfg.jobs.iter().enumerate() {
                 let keep = match job.keep_last {
                     0 => t!("behält alle", "keeps all").to_string(),
                     n => tr!("behält {n}", "keeps {n}"),
                 };
-                let description =
-                    tr!("{} · {} Ziel(e) · {keep}", "{} · {} target(s) · {keep}", job.schedule_text(), job.target_ids.len());
+                // Ein überfälliger Auftrag sagt nur das – es ist wichtiger als Zeitplan und Ziele,
+                // die ohnehin daneben stehen, und passt so auch in die schmale Zeile.
+                let (icon, description) = match overdue.iter().find(|o| o.job_id == job.id) {
+                    Some(late) => (Icon::Warning, late.short_text()),
+                    None => (
+                        Icon::Sync,
+                        tr!("{} · {} Ziel(e) · {keep}", "{} · {} target(s) · {keep}", job.schedule_text(), job.target_ids.len()),
+                    ),
+                };
                 let clicked = ui
                     .push_id(("job", job.id), |ui| {
-                        widgets::option_row(ui, index == self.job_edit, Mark::Radio, Icon::Sync, &job.name, &description).clicked()
+                        widgets::option_row(ui, index == self.job_edit, Mark::Radio, icon, &job.name, &description).clicked()
                     })
                     .inner;
                 if clicked {
@@ -5014,6 +5063,7 @@ impl App {
             })
             .collect();
         let last_run = self.history.iter().rev().find(|r| r.job_id == id).cloned();
+        let late = jobs::overdue(job, &self.history, Local::now().naive_local());
         let confirm_delete = self.job_delete == Some(id);
         let (mut run, mut save, mut delete) = (false, false, false);
         widgets::card(ui, |ui| {
@@ -5139,6 +5189,18 @@ impl App {
                             ui.add(egui::Label::new(RichText::new(&record.text).font(theme::regular(12.0)).color(color)).wrap());
                         }
                         None => widgets::kv_row(ui, t!("Letzter Lauf", "Last run"), t!("noch keiner", "none yet")),
+                    }
+                    if let Some(late) = &late {
+                        ui.add_space(4.0);
+                        warning_line(
+                            ui,
+                            &tr!(
+                                "Überfällig: {}. Starte den Auftrag jetzt – und prüfe, ob der PC zur geplanten Zeit an ist.",
+                                "Overdue: {}. Run the job now – and check that the PC is on at the scheduled time.",
+                                late.short_text()
+                            ),
+                        );
+                        ui.add_space(4.0);
                     }
                     widgets::kv_row(ui, t!("Für Skripte", "For scripts"), &format!("ZEBack.exe --run-job {id}"));
                 });

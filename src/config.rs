@@ -251,6 +251,9 @@ pub struct SavedJob {
     pub weekday: u8,
     pub hour: u8,
     pub minute: u8,
+    /// Wann der Auftrag angelegt wurde, z. B. `10.11.2026 14:30`. Daran misst sich, ob ein
+    /// Auftrag überfällig ist, der noch nie gelaufen ist. Leer bei Aufträgen aus Versionen vor 0.20.
+    pub created: String,
 }
 
 impl Default for SavedJob {
@@ -273,6 +276,7 @@ impl Default for SavedJob {
             weekday: 0,
             hour: 12,
             minute: 0,
+            created: String::new(),
         }
     }
 }

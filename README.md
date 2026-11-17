@@ -61,6 +61,8 @@ new version and installs it with one click.
 - **Back up changes only** saves time and space
 - Old backups are **cleaned up** if you want
 - **Reports** by email or Windows notification when something goes wrong
+- **Warns when a backup is overdue** – if a job has not backed up successfully for too long, ZEBack
+  says so at startup, on the Jobs page and in the email report
 - Keeps running **in the background**: during a backup the window can be hidden next to the clock
   without stopping it
 
@@ -207,8 +209,8 @@ creates the installers from the existing EXE files.
 2. Create a tag with the same number and push it:
 
    ```powershell
-   git tag v0.19.1
-   git push origin v0.19.1
+   git tag v0.20.0
+   git push origin v0.20.0
    ```
 
 GitHub does the rest (`.github/workflows/release.yml`): it builds both architectures, creates the

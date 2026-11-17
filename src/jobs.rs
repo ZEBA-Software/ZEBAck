@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::backup::{self, BackupJob, BackupKind, BackupSummary, Destination, Incremental, SmbLogin};
@@ -296,7 +296,8 @@ pub fn mail_from(settings: &config::MailSettings, password: String) -> Mail {
 }
 
 /// Betreff und Text des Berichts über einen Lauf.
-pub fn report_text(job_name: &str, ok: bool, text: &str, saved: &[String]) -> (String, String) {
+/// `overdue` nennt andere Aufträge, die schon zu lange nicht mehr gesichert haben.
+pub fn report_text(job_name: &str, ok: bool, text: &str, saved: &[String], overdue: &[Overdue]) -> (String, String) {
     let computer = std::env::var("COMPUTERNAME").unwrap_or_default();
     let subject = tr!(
         "ZEBack: Sicherung „{job_name}“ {} ({computer})",
@@ -313,6 +314,12 @@ pub fn report_text(job_name: &str, ok: bool, text: &str, saved: &[String]) -> (S
         body.push_str(t!("\nGespeichert:\n", "\nSaved to:\n"));
         for place in saved {
             body.push_str(&format!("- {place}\n"));
+        }
+    }
+    if !overdue.is_empty() {
+        body.push_str(t!("\nAchtung, überfällig:\n", "\nAttention, overdue:\n"));
+        for job in overdue {
+            body.push_str(&format!("- {}\n", job.text()));
         }
     }
     body.push_str(t!(
@@ -360,7 +367,7 @@ pub fn execute(saved: &SavedJob, job: &BackupJob, mail: &MailReport, rep: &Repor
     {
         rep.status(t!("Bericht wird per E-Mail gesendet …", "Sending report by e-mail …"));
         let places = result.as_ref().map(|s| s.saved.clone()).unwrap_or_default();
-        let (subject, body) = report_text(&saved.name, result.is_ok(), &text, &places);
+        let (subject, body) = report_text(&saved.name, result.is_ok(), &text, &places, &other_overdue(saved.id));
         match crate::mail::send(mail, &subject, &body) {
             Ok(()) => rep.log(tr!("Bericht per E-Mail gesendet an {}.", "Report sent by e-mail to {}.", mail.to)),
             Err(e) => rep.warn(tr!(
@@ -471,6 +478,99 @@ pub struct RunRecord {
     pub text: String,
 }
 
+/// Form der Zeitangaben im Verlauf und am Auftrag, z. B. `10.11.2026 14:30`.
+const STAMP: &str = "%d.%m.%Y %H:%M";
+
+/// Die Zeit jetzt, so wie sie im Verlauf steht.
+pub fn now_stamp() -> String {
+    Local::now().format(STAMP).to_string()
+}
+
+// ---------------------------------------------------------------------------- Überfällig
+
+/// Ein Auftrag, dessen letzte gelungene Sicherung zu lange her ist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Overdue {
+    pub job_id: u64,
+    pub job_name: String,
+    /// Volle Tage seit der letzten gelungenen Sicherung – oder, wenn es noch keine gab, seit
+    /// der Auftrag angelegt wurde.
+    pub days: i64,
+    /// Der Auftrag hat noch nie erfolgreich gesichert.
+    pub never: bool,
+}
+
+impl Overdue {
+    /// Der Hinweis als ganzer Satz, mit dem Namen des Auftrags.
+    pub fn text(&self) -> String {
+        if self.never {
+            tr!(
+                "„{}“ hat noch nie gesichert – angelegt vor {} Tagen.",
+                "“{}” has never backed up – created {} days ago.",
+                self.job_name,
+                self.days
+            )
+        } else {
+            tr!(
+                "„{}“: letzte gelungene Sicherung vor {} Tagen.",
+                "“{}”: last successful backup {} days ago.",
+                self.job_name,
+                self.days
+            )
+        }
+    }
+
+    /// Kurzform für die Liste der Aufträge.
+    pub fn short_text(&self) -> String {
+        if self.never {
+            t!("noch nie gesichert", "never backed up").to_string()
+        } else {
+            tr!("seit {} Tagen nicht gesichert", "not backed up for {} days", self.days)
+        }
+    }
+}
+
+/// Nach so vielen Tagen ohne gelungene Sicherung gilt ein Auftrag als überfällig: der Abstand
+/// des Zeitplans plus zwei Tage Luft (Wochenende, PC aus). Ohne Zeitplan sind es 30 Tage.
+pub fn overdue_after_days(schedule: config::ScheduleKind) -> i64 {
+    match schedule {
+        config::ScheduleKind::Daily => 3,
+        config::ScheduleKind::Weekly => 9,
+        config::ScheduleKind::Off => 30,
+    }
+}
+
+/// Ist der Auftrag überfällig? Maßgeblich ist der letzte gelungene Lauf im Verlauf; gab es
+/// noch keinen, zählt die Zeit seit dem Anlegen. Ohne beides lässt sich nichts sagen.
+pub fn overdue(job: &SavedJob, history: &[RunRecord], now: NaiveDateTime) -> Option<Overdue> {
+    let parse = |text: &str| NaiveDateTime::parse_from_str(text, STAMP).ok();
+    let last = history.iter().rev().filter(|r| r.job_id == job.id && r.ok).find_map(|r| parse(&r.finished));
+    let (since, never) = match last {
+        Some(time) => (time, false),
+        None => (parse(&job.created)?, true),
+    };
+    let days = (now - since).num_days();
+    (days >= overdue_after_days(job.schedule))
+        .then(|| Overdue { job_id: job.id, job_name: job.name.clone(), days, never })
+}
+
+/// Überfällige Aufträge außer dem, der gerade läuft – für den Bericht per E-Mail. So fällt ein
+/// Auftrag, der gar nicht mehr startet, wenigstens im Bericht eines anderen auf.
+fn other_overdue(running: u64) -> Vec<Overdue> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let jobs = Config::load().jobs;
+    let mut found = overdue_jobs(&jobs, &load_history(), Local::now().naive_local());
+    found.retain(|job| job.job_id != running);
+    found
+}
+
+/// Alle überfälligen Aufträge, in der Reihenfolge der Aufträge.
+pub fn overdue_jobs(jobs: &[SavedJob], history: &[RunRecord], now: NaiveDateTime) -> Vec<Overdue> {
+    jobs.iter().filter_map(|job| overdue(job, history, now)).collect()
+}
+
 fn history_path() -> Option<PathBuf> {
     Some(Config::data_dir()?.join("verlauf.json"))
 }
@@ -564,7 +664,7 @@ pub fn run_headless(job_id: u64) -> i32 {
             if let Some((mode, mail)) = mail_report(&cfg)
                 && mode.applies(false)
             {
-                let (subject, body) = report_text(&saved.name, false, &message, &[]);
+                let (subject, body) = report_text(&saved.name, false, &message, &[], &other_overdue(saved.id));
                 if let Err(e) = crate::mail::send(&mail, &subject, &body) {
                     write(&tr!(
                         "WARNUNG: Der E-Mail-Bericht wurde nicht gesendet: {e:#}",
@@ -716,6 +816,65 @@ mod tests {
         assert_eq!(left, expected);
         assert_eq!(fs::read_dir(&second).unwrap().count(), 1);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn jobs_without_a_recent_successful_backup_are_overdue() {
+        use crate::config::ScheduleKind;
+        let at = |text: &str| NaiveDateTime::parse_from_str(text, STAMP).unwrap();
+        let run = |job_id: u64, finished: &str, ok: bool| RunRecord {
+            job_id,
+            job_name: String::new(),
+            finished: finished.into(),
+            ok,
+            text: String::new(),
+        };
+        let job = |id: u64, schedule: ScheduleKind, created: &str| SavedJob {
+            id,
+            name: format!("Auftrag {id}"),
+            schedule,
+            created: created.into(),
+            ..SavedJob::default()
+        };
+        let daily = job(1, ScheduleKind::Daily, "01.11.2026 08:00");
+        let history = [
+            run(1, "10.11.2026 12:00", true),
+            // Ein anderer Auftrag und ein fehlgeschlagener Lauf zählen nicht.
+            run(2, "16.11.2026 12:00", true),
+            run(1, "16.11.2026 12:00", false),
+        ];
+
+        // Täglich: zwei Tage Luft, ab dem dritten Tag überfällig.
+        assert_eq!(overdue(&daily, &history, at("13.11.2026 11:59")), None);
+        let late = overdue(&daily, &history, at("17.11.2026 09:00")).unwrap();
+        assert_eq!((late.days, late.never), (6, false));
+        assert_eq!(late.text(), "„Auftrag 1“: letzte gelungene Sicherung vor 6 Tagen.");
+        assert_eq!(late.short_text(), "seit 6 Tagen nicht gesichert");
+
+        // Wöchentlich und von Hand haben mehr Zeit.
+        let weekly = job(1, ScheduleKind::Weekly, "");
+        assert_eq!(overdue(&weekly, &history, at("19.11.2026 11:00")), None);
+        assert!(overdue(&weekly, &history, at("19.11.2026 12:00")).is_some());
+        let manual = job(1, ScheduleKind::Off, "");
+        assert_eq!(overdue(&manual, &history, at("09.12.2026 12:00")), None);
+        assert!(overdue(&manual, &history, at("10.12.2026 12:00")).is_some());
+
+        // Noch nie gelungen: Es zählt die Zeit seit dem Anlegen.
+        let never = job(3, ScheduleKind::Daily, "14.11.2026 08:00");
+        assert_eq!(overdue(&never, &history, at("16.11.2026 08:00")), None);
+        let late = overdue(&never, &history, at("17.11.2026 08:00")).unwrap();
+        assert_eq!((late.days, late.never), (3, true));
+        assert_eq!(late.text(), "„Auftrag 3“ hat noch nie gesichert – angelegt vor 3 Tagen.");
+        // Ohne Anlegedatum (Auftrag aus einer älteren Version) lässt sich nichts sagen.
+        assert_eq!(overdue(&job(3, ScheduleKind::Daily, ""), &history, at("17.12.2026 08:00")), None);
+
+        let all = overdue_jobs(&[daily, job(2, ScheduleKind::Daily, ""), never], &history, at("17.11.2026 09:00"));
+        assert_eq!(all.iter().map(|o| o.job_id).collect::<Vec<_>>(), [1, 3]);
+
+        // Im Bericht eines anderen Auftrags stehen die überfälligen mit drin.
+        let (_, body) = report_text("Auftrag 2", true, "ok", &[], &all);
+        assert!(body.contains("Achtung, überfällig:\n- „Auftrag 1“: letzte gelungene Sicherung vor 6 Tagen.\n"), "{body}");
+        assert!(!report_text("Auftrag 2", true, "ok", &[], &[]).1.contains("überfällig"));
     }
 
     #[test]
