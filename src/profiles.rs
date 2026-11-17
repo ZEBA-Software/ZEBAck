@@ -83,7 +83,7 @@ struct OptionalDef {
 
 /// Zwischenspeicher von Chrome und Edge: groß, ständig in Benutzung und nach dem
 /// Wiederherstellen wertlos.
-const CHROMIUM_CACHES: &[&str] = &[
+pub(crate) const CHROMIUM_CACHES: &[&str] = &[
     "cache",
     "code cache",
     "gpucache",
@@ -109,8 +109,8 @@ const OPTIONAL: &[OptionalDef] = &[
     OptionalDef { key: "links", label: "Links", label_en: "Links", hint: "Schnellzugriff im Explorer", hint_en: "Quick access in File Explorer", group: Group::Profile, base: Base::Profile, paths: &["Links"], exclude: &[] },
     OptionalDef { key: "saved_games", label: "Gespeicherte Spiele", label_en: "Saved Games", hint: "Spielstände", hint_en: "Game saves", group: Group::Profile, base: Base::Profile, paths: &["Saved Games"], exclude: &[] },
     OptionalDef { key: "firefox", label: "Firefox", label_en: "Firefox", hint: "Lesezeichen, Passwörter, Einstellungen", hint_en: "Bookmarks, passwords, settings", group: Group::Browser, base: Base::Roaming, paths: &["Mozilla\\Firefox"], exclude: &[] },
-    OptionalDef { key: "chrome", label: "Chrome", label_en: "Chrome", hint: "Lesezeichen, Verlauf, Erweiterungen", hint_en: "Bookmarks, history, extensions", group: Group::Browser, base: Base::Local, paths: &["Google\\Chrome\\User Data"], exclude: CHROMIUM_CACHES },
-    OptionalDef { key: "edge", label: "Edge", label_en: "Edge", hint: "Lesezeichen, Verlauf, Erweiterungen", hint_en: "Bookmarks, history, extensions", group: Group::Browser, base: Base::Local, paths: &["Microsoft\\Edge\\User Data"], exclude: CHROMIUM_CACHES },
+    OptionalDef { key: "chrome", label: "Chrome", label_en: "Chrome", hint: "Lesezeichen, Verlauf, Einstellungen", hint_en: "Bookmarks, history, settings", group: Group::Browser, base: Base::Local, paths: &["Google\\Chrome\\User Data"], exclude: CHROMIUM_CACHES },
+    OptionalDef { key: "edge", label: "Edge", label_en: "Edge", hint: "Lesezeichen, Verlauf, Einstellungen", hint_en: "Bookmarks, history, settings", group: Group::Browser, base: Base::Local, paths: &["Microsoft\\Edge\\User Data"], exclude: CHROMIUM_CACHES },
     OptionalDef { key: "thunderbird", label: "Thunderbird", label_en: "Thunderbird", hint: "Mails, Konten, Adressbuch", hint_en: "Mail, accounts, address book", group: Group::Mail, base: Base::Roaming, paths: &["Thunderbird"], exclude: &[] },
     OptionalDef { key: "outlook_signatures", label: "Outlook-Signaturen", label_en: "Outlook signatures", hint: "Signaturen für E-Mails", hint_en: "Email signatures", group: Group::Mail, base: Base::Roaming, paths: &["Microsoft\\Signatures", "Microsoft\\Signaturen"], exclude: &[] },
     OptionalDef { key: "office_templates", label: "Office-Vorlagen", label_en: "Office templates", hint: "Eigene Vorlagen (z. B. Normal.dotm)", hint_en: "Custom templates (e.g. Normal.dotm)", group: Group::Mail, base: Base::Roaming, paths: &["Microsoft\\Templates", "Microsoft\\Vorlagen"], exclude: &[] },

@@ -2013,14 +2013,46 @@ impl App {
         if let (Some(only), Some(tree)) = (&only, &self.tree) {
             total_bytes = tree.total(only).1;
         }
+        let replace = self.whole_replacements(info);
         let job = RestoreJob { archive: info.path.clone(), mapping, conflict: self.conflict, total_bytes, password, only };
         // Teilsicherung mit vollständiger Kette: Vollsicherung und Teilsicherungen zusammenführen.
-        match self.chain.clone() {
-            Some(chain) => self.start(t!("Wiederherstellung", "Restore"), move |rep| {
-                restore::run_chain(&chain, &job, rep).map(Outcome::Restore)
-            }),
-            None => self.start(t!("Wiederherstellung", "Restore"), move |rep| restore::run(&job, rep).map(Outcome::Restore)),
+        let chain = self.chain.clone();
+        self.start(t!("Wiederherstellung", "Restore"), move |rep| {
+            // Browser und Mailprogramm zuerst beiseiteschieben: Sie kommen komplett aus der Sicherung.
+            let aside = restore::set_aside(&replace, rep)?;
+            let result = match &chain {
+                Some(chain) => restore::run_chain(chain, &job, rep),
+                None => restore::run(&job, rep),
+            };
+            if result.is_err() {
+                for moved in &aside {
+                    rep.warn(tr!(
+                        "{} ist nicht vollständig zurück. Der vorherige Stand liegt unverändert hier: {}",
+                        "{} was not brought back completely. The previous state is unchanged here: {}",
+                        moved.label,
+                        moved.to.display()
+                    ));
+                }
+            }
+            result.map(Outcome::Restore)
+        });
+    }
+
+    /// Ordner von Browsern und Mailprogrammen, die beim Wiederherstellen in ein Profil komplett
+    /// ersetzt werden: Name in der Sicherung und Zielordner. Bei einer Auswahl einzelner Dateien
+    /// und beim Wiederherstellen in einen anderen Ordner wird nichts ersetzt.
+    fn whole_replacements(&self, info: &ArchiveInfo) -> Vec<(String, PathBuf)> {
+        let Some(manifest) = &info.manifest else { return Vec::new() };
+        if self.restore_mode != RestoreMode::Profile || !info.fits_profile() || !self.picked.is_empty() {
+            return Vec::new();
         }
+        manifest
+            .roots
+            .iter()
+            .zip(&self.root_checked)
+            .filter(|(root, checked)| **checked && restore::replaced_as_whole(root.kind.as_deref()))
+            .filter_map(|(root, _)| Some((root.name.clone(), self.root_target(manifest, root)?)))
+            .collect()
     }
 
     /// Prüft die geöffnete Sicherung, ohne etwas wiederherzustellen.
@@ -3240,8 +3272,8 @@ impl App {
                 warning_line(
                     ui,
                     t!(
-                        "Gespeicherte Passwörter aus Chrome und Edge funktionieren nur auf diesem PC mit diesem Benutzer.",
-                        "Saved passwords from Chrome and Edge only work on this PC with this user."
+                        "Gespeicherte Passwörter, Anmeldungen und Erweiterungen aus Chrome und Edge funktionieren nur auf diesem PC mit diesem Benutzer.",
+                        "Saved passwords, sign-ins and extensions from Chrome and Edge only work on this PC with this user."
                     ),
                 );
             }
@@ -4211,6 +4243,37 @@ impl App {
             }
             if self.conflict == Conflict::Overwrite {
                 warning_line(ui, t!("Neuere Dateien am Ziel gehen dabei verloren.", "Newer files at the target will be lost."));
+            }
+            // Browser und Mailprogramm funktionieren nur als Ganzes: Sie werden unabhängig von
+            // der Wahl oben komplett ersetzt.
+            let whole: Vec<String> = self
+                .archive
+                .as_ref()
+                .map(|info| self.whole_replacements(info).into_iter().map(|(name, _)| name).collect())
+                .unwrap_or_default();
+            if !whole.is_empty() {
+                let names = whole.join(", ");
+                ui.add_space(6.0);
+                widgets::divider(ui);
+                ui.add_space(6.0);
+                warning_line(
+                    ui,
+                    &tr!(
+                        "Immer komplett ersetzt: {names}. Der bisherige Stand bleibt als Ordner daneben liegen. Bitte vorher schließen.",
+                        "Always replaced completely: {names}. The previous state stays next to it as a folder. Please close first."
+                    ),
+                );
+                if whole.iter().any(|name| name == "Chrome" || name == "Edge") {
+                    widgets::text(
+                        ui,
+                        t!(
+                            "Lesezeichen, Verlauf und Einstellungen kommen mit. Gespeicherte Passwörter, Anmeldungen und Erweiterungen funktionieren auf einem anderen PC nicht – dafür die Synchronisierung im Browser nutzen.",
+                            "Bookmarks, history and settings come along. Saved passwords, sign-ins and extensions do not work on another PC – use the browser's sync for those."
+                        ),
+                        theme::regular(12.0),
+                        TEXT_MUTED,
+                    );
+                }
             }
         });
     }

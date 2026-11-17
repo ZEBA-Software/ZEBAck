@@ -269,6 +269,58 @@ pub fn target_for(manifest: &Manifest, root: &ManifestRoot, profile: &Profile) -
     original
 }
 
+/// Daten von Programmen, die nur als Ganzes funktionieren (Browser, Mailprogramm): Eine
+/// Mischung aus dem Stand der Sicherung und dem, was am Ziel schon liegt, zeigt im Programm
+/// nichts oder nur die Hälfte – z. B. kennt das neue "Local State" von Chrome das alte Profil
+/// nicht. Solche Ordner werden deshalb immer komplett ersetzt.
+pub fn replaced_as_whole(kind: Option<&str>) -> bool {
+    matches!(kind, Some("chrome" | "edge" | "firefox" | "thunderbird"))
+}
+
+/// Ein Ordner, der vor dem Wiederherstellen beiseitegeschoben wurde.
+#[derive(Debug, PartialEq)]
+pub struct SetAside {
+    /// Name des Programms bzw. Ordners in der Sicherung, z. B. "Chrome"
+    pub label: String,
+    pub from: PathBuf,
+    /// Hier liegt der bisherige Stand jetzt
+    pub to: PathBuf,
+}
+
+/// Macht Platz für Ordner, die als Ganzes ersetzt werden: Was am Ziel schon liegt, wird
+/// umbenannt (nicht gelöscht). Gelingt das bei einem Ordner nicht – meist läuft das Programm
+/// noch –, kommen alle schon umbenannten wieder an ihren Platz und nichts ist verändert.
+pub fn set_aside(folders: &[(String, PathBuf)], rep: &Reporter) -> Result<Vec<SetAside>> {
+    let stamp = Local::now().format("%Y-%m-%d_%H%M%S").to_string();
+    let mut done: Vec<SetAside> = Vec::new();
+    for (label, path) in folders {
+        // Fehlt der Ordner oder ist er leer, gibt es nichts aufzuheben.
+        if !fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some()) {
+            continue;
+        }
+        let mut name = path.file_name().unwrap_or_default().to_owned();
+        name.push(format!(".{}-{stamp}", t!("vorher", "before")));
+        let to = path.with_file_name(name);
+        if let Err(e) = fs::rename(path, &to) {
+            for moved in done.iter().rev() {
+                let _ = fs::rename(&moved.to, &moved.from);
+            }
+            bail!(tr!(
+                "{label} läuft noch\nSchließe {label} ganz (auch im Infobereich neben der Uhr) und starte die Wiederherstellung noch einmal. Es wurde nichts verändert.\n{} ({e})",
+                "{label} is still running\nClose {label} completely (also in the notification area next to the clock) and start the restore again. Nothing was changed.\n{} ({e})",
+                path.display()
+            ));
+        }
+        rep.log(tr!(
+            "{label} wird komplett ersetzt. Der bisherige Stand liegt jetzt hier: {}",
+            "{label} is replaced completely. The previous state is now here: {}",
+            to.display()
+        ));
+        done.push(SetAside { label: label.clone(), from: path.clone(), to });
+    }
+    Ok(done)
+}
+
 fn to_system_time(time: zip::DateTime) -> Option<SystemTime> {
     let naive = NaiveDateTime::try_from(time).ok()?;
     Local.from_local_datetime(&naive).earliest().map(SystemTime::from)
@@ -1142,6 +1194,167 @@ mod tests {
         assert_eq!(run(&job, &rep).unwrap().restored, 2);
         assert!(target.join("Default").join("Bookmarks").is_file());
         assert!(!target.join("Default").join("Cache").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Chrome auf einem neuen PC, auf dem es schon einmal gestartet wurde: Der alte Stand kommt
+    /// nur an, wenn der Ordner als Ganzes ersetzt wird.
+    #[test]
+    fn browser_data_replaces_what_the_new_pc_already_has() {
+        let base = temp_dir("browser");
+        let relative = Path::new("AppData").join("Local").join("Google").join("Chrome").join("User Data");
+        // Alter PC: Lesezeichen und Verlauf liegen im Profil "Profile 1".
+        let old = base.join("alt").join(&relative);
+        write(&old.join("Local State"), br#"{"profile":{"info_cache":{"Profile 1":{}}}}"#);
+        write(&old.join("Profile 1").join("Bookmarks"), b"alle Lesezeichen");
+        write(&old.join("Profile 1").join("History"), b"alter Verlauf");
+        write(&old.join("Profile 1").join("Preferences"), b"alte Einstellungen");
+        // Neuer PC: Chrome lief schon einmal und kennt nur sein leeres Profil "Default".
+        let fresh = |target: &Path| {
+            write(&target.join("Local State"), br#"{"profile":{"info_cache":{"Default":{}}}}"#);
+            write(&target.join("Default").join("Preferences"), b"neue Einstellungen");
+            write(&target.join("Default").join("History"), b"leerer Verlauf");
+            write(&target.join("Default").join("History-journal"), b"offene Aenderung");
+        };
+
+        let job = BackupJob {
+            profile_name: "anna".into(),
+            profile_dir: base.join("alt"),
+            sources: vec![Source {
+                path: old.clone(),
+                kind: Some("chrome".into()),
+                name: Some("Chrome".into()),
+                exclude: Vec::new(),
+                exclude_paths: Vec::new(),
+            }],
+            destinations: vec![Destination::folder(base.join("ziel"))],
+            compression: Compression::Fast,
+            skip_online_only: true,
+            verify: true,
+            password: None,
+            incremental: None,
+        };
+        let (rep, _rx, _cancel) = Reporter::new(|| {});
+        let info = inspect(&backup::run(&job, &rep).unwrap().local_path.unwrap()).unwrap();
+        let manifest = info.manifest.clone().unwrap();
+        assert!(replaced_as_whole(manifest.roots[0].kind.as_deref()));
+        assert!(!replaced_as_whole(Some("documents")) && !replaced_as_whole(None));
+
+        let restore_into = |target: &Path| {
+            let job = RestoreJob {
+                archive: info.path.clone(),
+                mapping: Mapping::Roots(HashMap::from([("Chrome".to_string(), target.to_path_buf())])),
+                // Die Vorgabe der Oberfläche: vorhandene Dateien behalten.
+                conflict: Conflict::Skip,
+                total_bytes: info.total_bytes,
+                password: None,
+                only: None,
+            };
+            let (rep, _rx, _cancel) = Reporter::new(|| {});
+            run(&job, &rep).unwrap()
+        };
+
+        // Ohne Ersetzen mischt sich beides: Chrome liest weiter sein eigenes "Local State",
+        // das "Profile 1" nicht kennt – für den Benutzer fehlt alles.
+        let mixed = base.join("gemischt").join(&relative);
+        fresh(&mixed);
+        assert_eq!(restore_into(&mixed).skipped_existing, 1);
+        assert!(fs::read_to_string(mixed.join("Local State")).unwrap().contains("Default"));
+
+        // Mit Ersetzen: Der Ordner entspricht genau der Sicherung, der bisherige Stand liegt daneben.
+        let target = base.join("neu").join(&relative);
+        fresh(&target);
+        let (rep, _rx, _cancel) = Reporter::new(|| {});
+        let aside = set_aside(&[("Chrome".to_string(), target.clone())], &rep).unwrap();
+        assert_eq!(aside.len(), 1);
+        assert!(!target.exists());
+        let summary = restore_into(&target);
+        assert_eq!((summary.restored, summary.skipped_existing, summary.failed), (4, 0, 0));
+        assert_same_tree(&old, &target);
+        assert_eq!(fs::read(aside[0].to.join("Default").join("History-journal")).unwrap(), b"offene Aenderung");
+        assert_eq!(aside[0].to.parent(), target.parent());
+
+        // Ein fehlender oder leerer Zielordner braucht keinen Platzhalter.
+        fs::create_dir_all(base.join("leer")).unwrap();
+        let nothing = [("Chrome".to_string(), base.join("fehlt")), ("Edge".to_string(), base.join("leer"))];
+        assert_eq!(set_aside(&nothing, &rep).unwrap(), []);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Echter Lauf mit einem echten Browser-Ordner, nur auf Wunsch: sichert den Ordner aus
+    /// `ZEBACK_TEST_BROWSER_FROM` und spielt ihn nach `ZEBACK_TEST_BROWSER_TO` zurück, so wie es
+    /// die Wiederherstellung in ein Profil tut (bisherigen Stand beiseiteschieben, dann entpacken).
+    #[test]
+    #[ignore]
+    fn real_browser_folder_moves_to_another_place() {
+        let (Ok(from), Ok(to)) = (std::env::var("ZEBACK_TEST_BROWSER_FROM"), std::env::var("ZEBACK_TEST_BROWSER_TO")) else {
+            return;
+        };
+        let (from, to) = (PathBuf::from(from), PathBuf::from(to));
+        let base = temp_dir("browser-echt");
+        let job = BackupJob {
+            profile_name: "test".into(),
+            profile_dir: PathBuf::new(),
+            sources: vec![Source {
+                path: from,
+                kind: Some("chrome".into()),
+                name: Some("Chrome".into()),
+                exclude: crate::profiles::CHROMIUM_CACHES.iter().map(|s| s.to_string()).collect(),
+                exclude_paths: Vec::new(),
+            }],
+            destinations: vec![Destination::folder(base.join("ziel"))],
+            compression: Compression::Fast,
+            skip_online_only: true,
+            verify: true,
+            password: None,
+            incremental: None,
+        };
+        let (rep, rx, _cancel) = Reporter::new(|| {});
+        let saved = backup::run(&job, &rep).unwrap();
+        let info = inspect(&saved.local_path.unwrap()).unwrap();
+        let aside = set_aside(&[("Chrome".to_string(), to.clone())], &rep).unwrap();
+        let job = RestoreJob {
+            archive: info.path.clone(),
+            mapping: Mapping::Roots(HashMap::from([("Chrome".to_string(), to)])),
+            conflict: Conflict::Skip,
+            total_bytes: info.total_bytes,
+            password: None,
+            only: None,
+        };
+        let restored = run(&job, &rep).unwrap();
+        let warnings: Vec<String> =
+            rx.try_iter().filter_map(|m| if let Msg::Warn(text) = m { Some(text) } else { None }).collect();
+        println!(
+            "gesichert: {} Dateien, übersprungen: {} | zurück: {} Dateien, fehlgeschlagen: {}, behalten: {} | beiseite: {:?} | Warnungen: {warnings:?}",
+            saved.files, saved.skipped_errors, restored.restored, restored.failed, restored.skipped_existing, aside
+        );
+        assert_eq!((restored.restored, restored.failed, restored.skipped_existing), (saved.files, 0, 0));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Läuft ein Programm noch, lässt sich sein Ordner nicht umbenennen: Dann bleibt alles, wie es war.
+    #[cfg(windows)]
+    #[test]
+    fn set_aside_changes_nothing_when_a_program_is_still_running() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = temp_dir("browser-laeuft");
+        let (chrome, edge) = (base.join("Chrome"), base.join("Edge"));
+        write(&chrome.join("Local State"), b"chrome");
+        write(&edge.join("Local State"), b"edge");
+        // Wie ein laufender Browser: Datei geöffnet, ohne Umbenennen oder Löschen zu erlauben.
+        let open = fs::OpenOptions::new().read(true).share_mode(0).open(edge.join("Local State")).unwrap();
+
+        let (rep, _rx, _cancel) = Reporter::new(|| {});
+        let folders = [("Chrome".to_string(), chrome.clone()), ("Edge".to_string(), edge.clone())];
+        let error = set_aside(&folders, &rep).unwrap_err().to_string();
+        assert!(error.starts_with("Edge läuft noch"), "{error}");
+        // Chrome war schon umbenannt und liegt wieder an seinem Platz.
+        assert_eq!(fs::read(chrome.join("Local State")).unwrap(), b"chrome");
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 2);
+
+        drop(open);
+        assert_eq!(set_aside(&folders, &rep).unwrap().len(), 2);
+        assert!(!chrome.exists() && !edge.exists());
         let _ = fs::remove_dir_all(base);
     }
 

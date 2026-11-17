@@ -111,6 +111,16 @@ than the backup.
 </details>
 
 <details>
+<summary><b>Does my browser come along to a new PC?</b></summary>
+
+Bookmarks, history and settings of Chrome, Edge and Firefox do – tick the browser under
+<b>Additional</b> when backing up. Close the browser before backing up and before restoring. When
+restoring into a user profile, ZEBack replaces the browser's folder completely and keeps the
+previous one next to it. Saved passwords, sign-ins and extensions of Chrome and Edge are tied to the
+old PC by the browser itself: use the browser's sync for those, or export your passwords first.
+</details>
+
+<details>
 <summary><b>How do I restore a system image?</b></summary>
 
 A system image is restored outside the running Windows, through the Windows repair menu. ZEBack
@@ -197,8 +207,8 @@ creates the installers from the existing EXE files.
 2. Create a tag with the same number and push it:
 
    ```powershell
-   git tag v0.19.0
-   git push origin v0.19.0
+   git tag v0.19.1
+   git push origin v0.19.1
    ```
 
 GitHub does the rest (`.github/workflows/release.yml`): it builds both architectures, creates the
