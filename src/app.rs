@@ -37,7 +37,7 @@ use crate::widgets::{self, Icon, Kind, Mark};
 
 const MAX_LOG_LINES: usize = 2000;
 /// Website des Herstellers; öffnet sich beim Klick auf den Herstellernamen.
-const VENDOR_URL: &str = "https://zeba-software.de";
+const VENDOR_URL: &str = "https://zebasoft.de";
 const SIDEBAR_WIDTH: f32 = 208.0;
 /// Schmale Seitenleiste (nur Symbole) für schmale Fenster
 const SIDEBAR_COMPACT: f32 = 56.0;

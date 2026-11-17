@@ -27,7 +27,7 @@ fn main() {
         resource.set("InternalName", "ZEBack");
         resource.set("OriginalFilename", "ZEBack.exe");
         resource.set("CompanyName", "ZEBA Software UG");
-        resource.set("LegalCopyright", "Copyright (c) 2026 ZEBA Software UG - zeba-software.de");
+        resource.set("LegalCopyright", "Copyright (c) 2026 ZEBA Software UG - zebasoft.de");
         if let Err(e) = resource.compile() {
             // Ohne Ressourcen-Compiler funktioniert das Programm trotzdem, nur ohne EXE-Icon.
             println!("cargo:warning=EXE-Icon konnte nicht eingebettet werden: {e}");

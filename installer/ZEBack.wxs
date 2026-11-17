@@ -90,8 +90,8 @@
       ARPNOMODIFY setzt der Assistent (WixUI_Minimal) schon selbst; ein zweiter Eintrag hier
       bricht den Bau mit "Duplicate symbol" ab.
     -->
-    <Property Id="ARPURLINFOABOUT" Value="https://zeba-software.de" />
-    <Property Id="ARPHELPLINK" Value="https://zeba-software.de" />
+    <Property Id="ARPURLINFOABOUT" Value="https://zebasoft.de" />
+    <Property Id="ARPHELPLINK" Value="https://zebasoft.de" />
     <Property Id="ARPNOREPAIR" Value="1" />
     <Property Id="ARPCOMMENTS" Value="Backup and restore: user profiles, drives, system images" />
   </Product>

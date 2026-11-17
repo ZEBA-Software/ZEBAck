@@ -209,8 +209,8 @@ creates the installers from the existing EXE files.
 2. Create a tag with the same number and push it:
 
    ```powershell
-   git tag v0.20.0
-   git push origin v0.20.0
+   git tag v0.20.1
+   git push origin v0.20.1
    ```
 
 GitHub does the rest (`.github/workflows/release.yml`): it builds both architectures, creates the
