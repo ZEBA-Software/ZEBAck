@@ -1,0 +1,16 @@
+[package]
+name = "zeback-remote"
+description = "Sichern und Wiederherstellen gegen einen ZEBack Server, ohne Oberfläche"
+version = "0.1.0"
+edition = "2024"
+authors = ["ZEBA Software UG"]
+license = "Apache-2.0"
+repository = "https://github.com/ZEBA-Software/ZEBack"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# Ohne TLS: Die Verbindung (samt Windows-eigenem TLS) baut das Programm, das dieses Crate nutzt.
+ureq = { version = "3.5.1", default-features = false }
+zeback-format = { path = "../zeback-format" }

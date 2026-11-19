@@ -8,6 +8,11 @@ license = "Apache-2.0"
 repository = "https://github.com/ZEBA-Software/ZEBack"
 description = "Backup and restore tool for Windows: user profiles, drives and system images"
 
+# Das Blockformat und die Anbindung an ZEBack Server sind eigene Crates: ZEBack Server bindet
+# zeback-format ebenfalls ein, und beide lassen sich ohne Oberfläche testen.
+[workspace]
+members = ["crates/zeback-format", "crates/zeback-remote"]
+
 [[bin]]
 name = "ZEBack"
 path = "src/main.rs"

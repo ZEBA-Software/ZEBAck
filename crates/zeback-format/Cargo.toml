@@ -1,0 +1,21 @@
+[package]
+name = "zeback-format"
+description = "Gemeinsames Blockformat von ZEBack (Client) und ZEBack Server"
+version = "0.1.0"
+edition = "2024"
+authors = ["ZEBA Software UG"]
+license = "Apache-2.0"
+repository = "https://github.com/ZEBA-Software/ZEBack"
+
+[dependencies]
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc"] }
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11.0"
+fastcdc = "5.0.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+zeroize = "1.9.2"
+zstd = { version = "0.14.4", default-features = false }
