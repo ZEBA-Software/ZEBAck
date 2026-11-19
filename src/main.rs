@@ -21,6 +21,7 @@ mod remote;
 mod restore;
 mod s3;
 mod schedule;
+mod server;
 mod sftp;
 mod sizes;
 mod smb;

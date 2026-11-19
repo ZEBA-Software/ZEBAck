@@ -15,6 +15,10 @@ pub enum Error {
     PasswordRequired,
     #[error("Abgebrochen")]
     Cancelled,
+    /// Eine Datei der Quelle ließ sich nicht öffnen oder lesen. Die Sicherung selbst ist
+    /// davon nicht betroffen und kann mit der nächsten Datei weitermachen.
+    #[error("Datei nicht lesbar: {0}")]
+    Source(#[source] io::Error),
     #[error(transparent)]
     Format(#[from] zeback_format::Error),
     #[error(transparent)]

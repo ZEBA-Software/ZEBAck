@@ -138,6 +138,8 @@ pub enum Destination {
     Folder { name: String, path: PathBuf, login: Option<SmbLogin> },
     /// Ziel im Netz: Nextcloud, WebDAV oder S3-Speicher
     Cloud { name: String, settings: RemoteSettings },
+    /// ZEBack Server: Hierhin geht keine ZIP-Datei, sondern eine Sicherung in Blöcken.
+    Server { name: String, login: crate::server::ServerLogin },
 }
 
 #[cfg(test)]
@@ -185,6 +187,10 @@ pub struct BackupSummary {
     pub saved: Vec<String>,
     pub kind: BackupKind,
     pub duration: Duration,
+    /// An ZEBack Server übertragene Bytes (dort wird nur gesendet, was der Server noch nicht hat)
+    pub uploaded: u64,
+    /// Es ging mindestens ein Ziel vom Typ ZEBack Server mit
+    pub to_server: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -253,7 +259,7 @@ struct State {
     files: HashMap<String, FileStamp>,
 }
 
-fn file_stamp(meta: &fs::Metadata) -> FileStamp {
+pub(crate) fn file_stamp(meta: &fs::Metadata) -> FileStamp {
     let modified = meta
         .modified()
         .ok()
@@ -307,6 +313,7 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
     // Datenträger erst nach dem Packen auf.
     let mut folders: Vec<(&str, &Path)> = Vec::new();
     let mut clouds: Vec<(&str, Box<dyn Remote>)> = Vec::new();
+    let mut servers: Vec<(&str, crate::server::Ready)> = Vec::new();
     for destination in &job.destinations {
         rep.check()?;
         match destination {
@@ -326,8 +333,71 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
                 let client = settings.connect().with_context(|| tr!("Ziel „{name}“", "Target “{name}”"))?;
                 clouds.push((name.as_str(), client));
             }
+            Destination::Server { name, login } => {
+                rep.status(tr!("Verbindung zu „{name}“ wird geprüft …", "Checking the connection to “{name}” …"));
+                servers.push((name.as_str(), crate::server::open_named(name, login, job.password.as_deref(), rep)?));
+            }
         }
     }
+
+    // Ordner und Cloud-Ziele bekommen eine ZIP-Datei, ZEBack Server eine Sicherung in Blöcken.
+    let mut summary =
+        if folders.is_empty() && clouds.is_empty() { None } else { Some(run_zip(job, &sources, &folders, &clouds, rep, started)?) };
+    for (name, ready) in &servers {
+        let outcome = crate::server::backup(job, &sources, name, ready, rep).map_err(|error| {
+            if error.is::<crate::job::Cancelled>() {
+                return error;
+            }
+            let error = error.context(tr!("Ziel „{name}“ ist fehlgeschlagen", "Target “{name}” failed"));
+            // Schlägt der Server fehl, soll die Meldung sagen, wo die Sicherung schon liegt.
+            match &summary {
+                Some(done) if !done.saved.is_empty() => error.context(tr!(
+                    "Die Sicherung liegt bereits hier: {}",
+                    "The backup is already stored here: {}",
+                    done.saved.join("; ")
+                )),
+                _ => error,
+            }
+        })?;
+        let summary = summary.get_or_insert_with(|| BackupSummary {
+            files: outcome.files,
+            bytes: outcome.bytes,
+            zip_size: 0,
+            skipped_errors: outcome.skipped_errors,
+            skipped_online: outcome.skipped_online,
+            verified: false,
+            encrypted: outcome.encrypted,
+            local_path: None,
+            saved: Vec::new(),
+            kind: BackupKind::Full,
+            duration: Duration::ZERO,
+            uploaded: 0,
+            to_server: true,
+        });
+        // Für die ZIP-Ziele gab es nichts Neues – der Server hat trotzdem eine vollständige Sicherung.
+        if summary.kind == BackupKind::Unchanged {
+            summary.kind = BackupKind::Full;
+            summary.files = outcome.files;
+            summary.bytes = outcome.bytes;
+        }
+        summary.to_server = true;
+        summary.uploaded += outcome.uploaded;
+        summary.saved.push(format!("{name}: {}", outcome.place));
+    }
+    let mut summary = summary.expect("mindestens ein Ziel ist geprüft");
+    summary.duration = started.elapsed();
+    Ok(summary)
+}
+
+/// Packt die Quellen in eine ZIP-Datei und legt sie an allen Ordner- und Cloud-Zielen ab.
+fn run_zip(
+    job: &BackupJob,
+    sources: &[Source],
+    folders: &[(&str, &Path)],
+    clouds: &[(&str, Box<dyn Remote>)],
+    rep: &Reporter,
+    started: Instant,
+) -> Result<BackupSummary> {
 
     // Nur Geändertes sichern: Gibt es einen Stand der letzten Sicherung und ist noch keine
     // Vollsicherung fällig, entsteht eine Teilsicherung.
@@ -351,7 +421,7 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
     let mut work_file = TempFile::new(&work_path);
 
     rep.status(t!("Dateien werden gezählt …", "Counting files …"));
-    let (total_files, total_bytes) = scan(&sources, job.skip_online_only, &work_path, known, rep)?;
+    let (total_files, total_bytes) = scan(sources, job.skip_online_only, &work_path, known, rep)?;
     if partial {
         rep.log(tr!(
             "Teilsicherung: {total_files} neue oder geänderte Dateien ({}).",
@@ -368,7 +438,7 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
 
     let base = previous.as_ref().map(|state| state.base.clone());
     let mut current: HashMap<String, FileStamp> = HashMap::new();
-    let stats = write_archive(&sources, job, &work_path, total_bytes, known, base.clone(), &mut current, rep)?;
+    let stats = write_archive(sources, job, &work_path, total_bytes, known, base.clone(), &mut current, rep)?;
     if partial && stats.files == 0 {
         // Nichts geändert: keine leere ZIP-Datei anlegen (die Arbeitsdatei räumt sich selbst weg).
         rep.log(t!(
@@ -387,6 +457,8 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
             saved: Vec::new(),
             kind: BackupKind::Unchanged,
             duration: started.elapsed(),
+            uploaded: 0,
+            to_server: false,
         });
     }
     let zip_size = fs::metadata(&work_path)?.len();
@@ -450,7 +522,7 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
         saved.push(format!("{name}: {}", copy.display()));
     }
 
-    for (name, client) in &clouds {
+    for (name, client) in clouds {
         rep.status(tr!("Upload nach „{name}“ ({}) …", "Uploading to “{name}” ({}) …", fmt_bytes(zip_size)));
         let uploaded = client.upload(&source_file, &file_name, rep).map_err(|e| explain(e, name, &saved))?;
         rep.log(tr!("Hochgeladen nach „{name}“: {uploaded}", "Uploaded to “{name}”: {uploaded}"));
@@ -518,6 +590,8 @@ pub fn run(job: &BackupJob, rep: &Reporter) -> Result<BackupSummary> {
         saved,
         kind: if partial { BackupKind::Partial } else { BackupKind::Full },
         duration: started.elapsed(),
+        uploaded: 0,
+        to_server: false,
     })
 }
 
@@ -630,7 +704,7 @@ pub(crate) fn is_online_only(_meta: &fs::Metadata) -> bool {
 }
 
 /// Erster Durchlauf: Anzahl und Gesamtgröße für die Fortschrittsanzeige ermitteln.
-fn scan(
+pub(crate) fn scan(
     sources: &[Source],
     skip_online: bool,
     exclude: &Path,
@@ -664,7 +738,7 @@ fn scan(
 }
 
 /// Eindeutiger Ordnername auf oberster Ebene des Archivs.
-fn root_name(source: &Source, used: &mut HashSet<String>) -> String {
+pub(crate) fn root_name(source: &Source, used: &mut HashSet<String>) -> String {
     let path = &source.path;
     let base = source
         .name
@@ -689,7 +763,7 @@ fn root_name(source: &Source, used: &mut HashSet<String>) -> String {
     name
 }
 
-fn entry_name(root: &str, rel: &Path) -> String {
+pub(crate) fn entry_name(root: &str, rel: &Path) -> String {
     let mut name = String::from(root);
     for comp in rel.components() {
         name.push('/');

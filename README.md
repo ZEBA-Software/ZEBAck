@@ -236,6 +236,7 @@ Comments in the source code are written in German.
 | `src/jobs.rs`, `src/schedule.rs` | Jobs, schedule, clean-up, running without a window |
 | `src/sysimage.rs` | System image via `wbadmin` |
 | `src/nextcloud.rs`, `src/s3.rs`, `src/sftp.rs`, `src/smb.rs`, `src/remote.rs` | Backup targets on the network |
+| `src/server.rs`, `crates/zeback-remote`, `crates/zeback-format` | Backup target “ZEBack Server”: backups in deduplicated blocks instead of a ZIP file (see `crates/README.md`) |
 | `src/mail.rs`, `src/notify.rs`, `src/update.rs`, `src/tray.rs` | Reports, updates, icon next to the clock |
 | `src/config.rs` | Settings (`%APPDATA%\ZEBack`) |
 | `src/i18n.rs` | Language switch; texts are written in both languages right where they are used, with `t!` / `tr!` |

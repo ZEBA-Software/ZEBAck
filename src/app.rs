@@ -20,6 +20,7 @@ use crate::backup::{self, BackupJob, BackupKind, BackupSummary, Destination, Man
 use crate::config::{self, Compression, Config, ExtraFolder, Language, ReportMode, SavedJob, ScheduleKind, Target, TargetKind};
 use crate::jobs::{self, FoundBackup, Place, RunRecord};
 use crate::schedule;
+use crate::server;
 use crate::disk::{self, DiskProbe, Drive, Probe};
 use crate::sizes::SizeScanner;
 use crate::sysimage::{self, Answer, ExistingImage, ImageJob, ImageSummary, SystemFacts};
@@ -121,6 +122,8 @@ enum Outcome {
     TargetTest(String),
     /// Anmeldung im Browser bestätigt: Zugangsdaten für das Nextcloud-Ziel mit dieser Kennung
     NcLogin(u64, BrowserLogin),
+    /// Das Ziel mit dieser Kennung ist mit einem ZEBack Server gekoppelt
+    ServerPaired(u64, server::Paired),
     Inspected(ArchiveInfo),
     Verified(VerifyReport),
     Image(ImageSummary),
@@ -202,6 +205,9 @@ pub struct App {
     /// Passwörter der Sicherungsziele (Kennung → Passwort), nur im Arbeitsspeicher;
     /// dauerhaft liegen sie in der Windows-Anmeldeinformationsverwaltung.
     target_passwords: HashMap<u64, String>,
+    /// Kopplungscodes für ZEBack Server (Kennung des Ziels → Code), gerade eingetippt und noch
+    /// nicht eingelöst. Sie werden nie gespeichert.
+    server_codes: HashMap<u64, String>,
     /// Auf der Seite "Sicherungsziele" ausgewähltes Ziel
     target_edit: usize,
     /// Ziel, dessen Löschen noch bestätigt werden muss (Kennung)
@@ -290,6 +296,7 @@ fn target_icon(kind: TargetKind) -> Icon {
         TargetKind::Nextcloud | TargetKind::WebDav => Icon::Cloud,
         TargetKind::S3 => Icon::Zip,
         TargetKind::Sftp => Icon::Key,
+        TargetKind::Server => Icon::Backup,
     }
 }
 
@@ -450,6 +457,7 @@ impl App {
             std_rows: Vec::new(),
             opt_rows: Vec::new(),
             target_passwords,
+            server_codes: HashMap::new(),
             target_edit: 0,
             target_delete: None,
             backup_password: String::new(),
@@ -987,15 +995,27 @@ impl App {
                 .to_string(),
             ),
             Outcome::Backup(s) => {
-                let mut text = tr!(
-                    "{} fertig\n{} Dateien ({}) gesichert. Die Sicherung ist {} groß und hat {} gedauert.",
-                    "{} finished\n{} files ({}) backed up. The backup is {} in size and took {}.",
-                    if s.kind == BackupKind::Partial { t!("Teilsicherung", "Partial backup") } else { t!("Backup", "Backup") },
-                    s.files,
-                    fmt_bytes(s.bytes),
-                    fmt_bytes(s.zip_size),
-                    fmt_duration(s.duration)
-                );
+                let mut text = if s.zip_size == 0 && s.to_server {
+                    // Nur ZEBack Server: Es gibt keine ZIP-Datei, übertragen wird nur Neues.
+                    tr!(
+                        "Backup fertig\n{} Dateien ({}) gesichert. Übertragen wurden {}, das hat {} gedauert.",
+                        "Backup finished\n{} files ({}) backed up. {} were transferred, which took {}.",
+                        s.files,
+                        fmt_bytes(s.bytes),
+                        fmt_bytes(s.uploaded),
+                        fmt_duration(s.duration)
+                    )
+                } else {
+                    tr!(
+                        "{} fertig\n{} Dateien ({}) gesichert. Die Sicherung ist {} groß und hat {} gedauert.",
+                        "{} finished\n{} files ({}) backed up. The backup is {} in size and took {}.",
+                        if s.kind == BackupKind::Partial { t!("Teilsicherung", "Partial backup") } else { t!("Backup", "Backup") },
+                        s.files,
+                        fmt_bytes(s.bytes),
+                        fmt_bytes(s.zip_size),
+                        fmt_duration(s.duration)
+                    )
+                };
                 for place in &s.saved {
                     text.push_str(&tr!("\nGespeichert – {place}", "\nSaved – {place}"));
                 }
@@ -1085,6 +1105,49 @@ impl App {
                 if !keep_stored && old_key != new_key && let Some(key) = old_key {
                     config::delete_password(&key);
                 }
+                self.persist();
+                self.persist_target_passwords();
+                (Level::Ok, text)
+            }
+            Outcome::ServerPaired(target_id, paired) => {
+                let Some(target) = self.cfg.targets.iter_mut().find(|t| t.id == target_id) else {
+                    return (
+                        Level::Warn,
+                        t!(
+                            "Gekoppelt, aber das Ziel wurde inzwischen gelöscht.",
+                            "Paired, but the target has been deleted in the meantime."
+                        )
+                        .to_string(),
+                    );
+                };
+                target.remote_dir = paired.repository.clone();
+                // Ohne gemerktes Token ließe sich das Ziel nach dem nächsten Start nicht mehr benutzen.
+                target.save_password = true;
+                let mut text = tr!(
+                    "Gekoppelt mit Repository „{}“\n{}",
+                    "Paired with repository “{}”\n{}",
+                    paired.repository,
+                    if paired.encrypted {
+                        t!(
+                            "Das Repository ist verschlüsselt. Schalte beim Sichern „Mit Passwort verschlüsseln“ ein – das Passwort der ersten Sicherung gilt danach für alle weiteren.",
+                            "The repository is encrypted. Turn on “Encrypt with password” when backing up – the password of the first backup then applies to all later ones."
+                        )
+                    } else {
+                        t!(
+                            "Das Repository ist unverschlüsselt: Die Dateien liegen lesbar auf dem Server.",
+                            "The repository is not encrypted: the files are stored readable on the server."
+                        )
+                    }
+                );
+                if paired.worm_days > 0 {
+                    text.push_str(&tr!(
+                        "\nNeue Sicherungen sind {} Tage gegen Löschen gesperrt.",
+                        "\nNew backups are locked against deletion for {} days.",
+                        paired.worm_days
+                    ));
+                }
+                self.target_passwords.insert(target_id, paired.token);
+                self.server_codes.remove(&target_id);
                 self.persist();
                 self.persist_target_passwords();
                 (Level::Ok, text)
@@ -1512,6 +1575,7 @@ impl App {
             TargetKind::WebDav => "WebDAV".to_string(),
             TargetKind::S3 => t!("S3-Speicher", "S3 storage").to_string(),
             TargetKind::Sftp => t!("SFTP-Server", "SFTP server").to_string(),
+            TargetKind::Server => "ZEBack Server".to_string(),
         };
         self.cfg.targets.push(Target {
             id,
@@ -1537,6 +1601,9 @@ impl App {
             let text = match destination {
                 Destination::Cloud { name, settings } => {
                     tr!("Ziel „{name}“ ist erreichbar\n{}", "Target “{name}” is reachable\n{}", settings.connect()?.describe())
+                }
+                Destination::Server { name, login } => {
+                    tr!("Ziel „{name}“ ist erreichbar\n{}", "Target “{name}” is reachable\n{}", server::describe(&login)?)
                 }
                 Destination::Folder { name, path, login } => {
                     if let Some(login) = &login {
@@ -1578,6 +1645,29 @@ impl App {
         self.start(t!("Anmeldung im Browser", "Sign-in in the browser"), move |rep| {
             let login = nextcloud::login_in_browser(&url, sysimage::open_in_browser, rep)?;
             Ok(Outcome::NcLogin(id, login))
+        });
+    }
+
+    /// Koppelt das Ziel an der Position `index` mit einem ZEBack Server: Der Code aus dessen
+    /// Dashboard wird gegen ein Token getauscht, das nur für dieses Gerät gilt.
+    fn start_pairing(&mut self, index: usize) {
+        let Some(target) = self.cfg.targets.get(index) else { return };
+        let (id, url) = (target.id, target.url.trim().to_string());
+        let code = self.server_codes.get(&id).map(|code| code.trim().to_string()).unwrap_or_default();
+        if url.is_empty() {
+            return self.fail(t!(
+                "Server-Adresse fehlt\nTrage zuerst die Adresse deines ZEBack Servers ein, z. B. https://backup.example.de.",
+                "Server address missing\nFirst enter the address of your ZEBack Server, e.g. https://backup.example.de."
+            ));
+        }
+        if code.is_empty() {
+            return self.fail(t!(
+                "Kopplungscode fehlt\nErzeuge im Dashboard des Servers beim gewünschten Repository einen Code („Gerät koppeln“) und trage ihn hier ein.",
+                "Pairing code missing\nCreate a code in the server's dashboard for the repository you want (“Pair device”) and enter it here."
+            ));
+        }
+        self.start(t!("Koppeln mit ZEBack Server", "Pairing with ZEBack Server"), move |_| {
+            Ok(Outcome::ServerPaired(id, server::pair(&url, &code)?))
         });
     }
 
@@ -3598,7 +3688,9 @@ impl App {
     fn ui_disk_info(&mut self, ui: &mut Ui) {
         let selected: Vec<&Target> = self.cfg.targets.iter().filter(|t| t.selected).collect();
         let folder = selected.iter().find(|t| t.kind == TargetKind::Local && !t.path.trim().is_empty());
-        let only_cloud = !selected.is_empty() && selected.iter().all(|t| t.kind.is_cloud());
+        // ZEBack Server braucht keinen Platz für eine ZIP-Datei, auch nicht im Temp-Ordner.
+        let zip_targets = || selected.iter().filter(|t| t.kind != TargetKind::Server);
+        let only_cloud = zip_targets().next().is_some() && zip_targets().all(|t| t.kind.is_cloud());
         let (path, label, unreachable, temp) = match folder {
             Some(target) => (
                 PathBuf::from(target.path.trim()),
@@ -4460,6 +4552,7 @@ impl App {
                     (TargetKind::WebDav, "WebDAV"),
                     (TargetKind::S3, t!("S3-Speicher", "S3 storage")),
                     (TargetKind::Sftp, "SFTP"),
+                    (TargetKind::Server, "ZEBack Server"),
                 ] {
                     if widgets::button(ui, label, Kind::Secondary, Some(target_icon(kind))).clicked() {
                         add = Some(kind);
@@ -4508,8 +4601,10 @@ impl App {
         let id = target.id;
         let kind = target.kind;
         let password = self.target_passwords.entry(id).or_default();
+        let pairing_code = self.server_codes.entry(id).or_default();
         let confirm_delete = self.target_delete == Some(id);
         let (mut pick, mut save, mut test, mut delete, mut browser_login) = (false, false, false, false, false);
+        let mut pair = false;
         let mut pick_key = false;
         widgets::card(ui, |ui| {
             widgets::card_header(ui, target_icon(kind), t!("Ziel bearbeiten", "Edit target"), kind.label(), None);
@@ -4612,6 +4707,49 @@ impl App {
                         widgets::field_label(ui, t!("Ordner im Bucket", "Folder in the bucket"));
                         widgets::text_field(ui, "remote_dir", &mut target.remote_dir, "Backups", false, width);
                     }
+                    TargetKind::Server => {
+                        widgets::field_label(ui, t!("Adresse des Servers", "Server address"));
+                        widgets::text_field(ui, "url", &mut target.url, "https://backup.example.de", false, width);
+                        ui.add_space(6.0);
+                        // Das Token aus dem Koppeln steht dort, wo andere Ziele ihr Passwort haben.
+                        if password.is_empty() {
+                            widgets::text(
+                                ui,
+                                t!(
+                                    "Noch nicht gekoppelt. Erzeuge im Dashboard des Servers beim gewünschten Repository einen Kopplungscode („Gerät koppeln“) und trage ihn hier ein. Der Code gilt 15 Minuten und nur einmal.",
+                                    "Not paired yet. In the server's dashboard, create a pairing code for the repository you want (“Pair device”) and enter it here. The code is valid for 15 minutes and only once."
+                                ),
+                                theme::regular(12.0),
+                                TEXT_MUTED,
+                            );
+                        } else {
+                            widgets::text(
+                                ui,
+                                tr!(
+                                    "Gekoppelt mit Repository „{}“. Für ein anderes Repository einen neuen Code eintragen und erneut koppeln.",
+                                    "Paired with repository “{}”. For a different repository, enter a new code and pair again.",
+                                    target.remote_dir
+                                ),
+                                theme::regular(12.0),
+                                TEXT,
+                            );
+                        }
+                        ui.add_space(4.0);
+                        widgets::field_label(ui, t!("Kopplungscode", "Pairing code"));
+                        widgets::text_field(ui, "pairing_code", pairing_code, "ABCD-EFGH-JKLM-NPQR", false, width);
+                        ui.add_space(6.0);
+                        pair = widgets::button(ui, t!("Koppeln", "Pair"), Kind::Primary, Some(Icon::Key)).clicked();
+                        ui.add_space(4.0);
+                        widgets::text(
+                            ui,
+                            t!(
+                                "Hierhin geht keine ZIP-Datei: ZEBack überträgt nur, was der Server noch nicht hat. Ob verschlüsselt wird, ist beim Repository auf dem Server festgelegt.",
+                                "No ZIP file goes here: ZEBack only transfers what the server does not have yet. Whether backups are encrypted is set for the repository on the server."
+                            ),
+                            theme::regular(12.0),
+                            TEXT_MUTED,
+                        );
+                    }
                     TargetKind::Sftp => {
                         widgets::field_label(ui, t!("Server (mit :Port, falls nicht 22)", "Server (with :port if not 22)"));
                         widgets::text_field(ui, "url", &mut target.url, "server.example.de", false, width);
@@ -4656,7 +4794,8 @@ impl App {
                         );
                     }
                 }
-                if target.needs_password() {
+                // Das Token eines ZEBack Servers wird immer gemerkt; dort gibt es nichts zu wählen.
+                if target.needs_password() && kind != TargetKind::Server {
                     ui.add_space(8.0);
                     widgets::divider(ui);
                     ui.add_space(6.0);
@@ -4673,7 +4812,8 @@ impl App {
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     // Bei Nextcloud ist die Anmeldung im Browser der Hauptweg, Speichern tritt zurück.
-                    let save_kind = if kind == TargetKind::Nextcloud { Kind::Secondary } else { Kind::Primary };
+                    let save_kind =
+                        if matches!(kind, TargetKind::Nextcloud | TargetKind::Server) { Kind::Secondary } else { Kind::Primary };
                     save = widgets::button(ui, t!("Speichern", "Save"), save_kind, Some(Icon::Check)).clicked();
                     test = widgets::button(ui, t!("Prüfen", "Check"), Kind::Secondary, Some(Icon::Sync)).clicked();
                     let label = if confirm_delete { t!("Wirklich löschen?", "Really delete?") } else { t!("Löschen", "Delete") };
@@ -4709,6 +4849,10 @@ impl App {
         if browser_login {
             self.target_delete = None;
             self.start_browser_login(index);
+        }
+        if pair {
+            self.target_delete = None;
+            self.start_pairing(index);
         }
         if delete {
             if confirm_delete {

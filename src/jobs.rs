@@ -47,6 +47,14 @@ pub fn check_target(target: &Target, password: &str) -> Result<(), String> {
         TargetKind::S3 if target.user.trim().is_empty() => missing(t!("Der Zugangsschlüssel", "The access key")),
         TargetKind::S3 if password.is_empty() => missing(t!("Der Geheimschlüssel", "The secret key")),
         kind if kind.is_cloud() && target.user.trim().is_empty() => missing(t!("Der Benutzername", "The user name")),
+        TargetKind::Server if target.url.trim().is_empty() => missing(t!("Die Server-Adresse", "The server address")),
+        TargetKind::Server if password.is_empty() => Err(tr!(
+            "Ziel „{}“ ist noch nicht gekoppelt
+Trage unter „Sicherungsziele“ den Kopplungscode aus dem Dashboard des Servers ein und wähle „Koppeln“.",
+            "Target “{}” is not paired yet
+Under “Backup targets”, enter the pairing code from the server's dashboard and choose “Pair”.",
+            target.name
+        )),
         _ if target.needs_password() && password.is_empty() => missing(t!("Das Passwort", "The password")),
         _ => Ok(()),
     }
@@ -79,7 +87,7 @@ pub fn remote_settings(target: &Target, password: &str) -> Result<Option<RemoteS
             key_file: target.path.trim().to_string(),
             remote_dir: target.remote_dir.trim().to_string(),
         })),
-        TargetKind::Local | TargetKind::Smb => None,
+        TargetKind::Local | TargetKind::Smb | TargetKind::Server => None,
     })
 }
 
@@ -104,6 +112,11 @@ pub fn destination(target: &Target, password: &str) -> Result<Destination, Strin
             }
             Destination::Folder { name: target.name.clone(), path, login: None }
         }
+        // Das „Passwort“ dieses Ziels ist das Token aus dem Koppeln.
+        TargetKind::Server => Destination::Server {
+            name: target.name.clone(),
+            login: crate::server::ServerLogin { url: target.url.trim().to_string(), token: password.to_string() },
+        },
         TargetKind::Smb => Destination::Folder {
             name: target.name.clone(),
             path: PathBuf::from(target.path.trim()),
@@ -115,10 +128,19 @@ pub fn destination(target: &Target, password: &str) -> Result<Destination, Strin
 }
 
 /// Alle Ziele in der Reihenfolge, in der gesichert wird: Ordner vor Freigaben vor Nextcloud,
-/// damit die ZIP-Datei möglichst direkt auf einem Datenträger entsteht.
+/// damit die ZIP-Datei möglichst direkt auf einem Datenträger entsteht. ZEBack Server kommt
+/// zuletzt; dorthin geht keine ZIP-Datei.
 pub fn destinations(targets: &[&Target], password_of: &dyn Fn(&Target) -> String) -> Result<Vec<Destination>, String> {
     let mut result = Vec::new();
-    for kind in [TargetKind::Local, TargetKind::Smb, TargetKind::Nextcloud, TargetKind::WebDav, TargetKind::S3, TargetKind::Sftp] {
+    for kind in [
+        TargetKind::Local,
+        TargetKind::Smb,
+        TargetKind::Nextcloud,
+        TargetKind::WebDav,
+        TargetKind::S3,
+        TargetKind::Sftp,
+        TargetKind::Server,
+    ] {
         for target in targets.iter().filter(|t| t.kind == kind) {
             result.push(destination(target, &password_of(target))?);
         }
@@ -175,6 +197,8 @@ pub fn find_backups(targets: &[(Target, String)], rep: &Reporter) -> Vec<FoundBa
                         .map(|file| hit(file.name.clone(), file.size, file.modified, Place::Cloud(file)))
                         .collect())
                 }
+                // Auf ZEBack Server liegen keine ZIP-Dateien.
+                Destination::Server { .. } => Ok(Vec::new()),
                 Destination::Folder { path, login, .. } => {
                     if let Some(login) = &login {
                         crate::smb::connect(&path.to_string_lossy(), &login.user, &login.password)?;
@@ -348,6 +372,14 @@ pub fn execute(saved: &SavedJob, job: &BackupJob, mail: &MailReport, rep: &Repor
         Ok(s) if s.kind == BackupKind::Unchanged => {
             t!("Keine Änderungen seit der letzten Sicherung", "No changes since the last backup").to_string()
         }
+        Ok(s) if s.zip_size == 0 && s.to_server => tr!(
+            "{} Dateien ({}) an ZEBack Server, {} übertragen, in {}",
+            "{} files ({}) to ZEBack Server, {} transferred, in {}",
+            s.files,
+            fmt_bytes(s.bytes),
+            fmt_bytes(s.uploaded),
+            fmt_duration(s.duration)
+        ),
         Ok(s) => tr!(
             "{}{} Dateien ({}) als ZIP mit {} in {}",
             "{}{} files ({}) as a {} ZIP in {}",
@@ -413,6 +445,9 @@ pub fn prune(job: &BackupJob, keep: u32, rep: &Reporter) -> u32 {
     let mut removed = 0;
     for destination in &job.destinations {
         match destination {
+            Destination::Server { name, login } => {
+                removed += crate::server::prune(login, name, &job.profile_name, keep as u32, rep);
+            }
             Destination::Folder { name, path, .. } => {
                 let names = match fs::read_dir(path) {
                     Ok(entries) => entries

@@ -66,6 +66,8 @@ pub struct SnapshotMeta {
     pub created: String,
     pub computer: String,
     pub user: String,
+    /// Profilordner, z. B. `C:\Users\anna`
+    pub profile_dir: String,
     pub tool_version: String,
     pub roots: Vec<Root>,
 }
@@ -146,8 +148,8 @@ impl<'a> SnapshotWriter<'a> {
     }
 
     /// Sichert eine Datei. `open` wird nur gerufen, wenn die Datei wirklich gelesen werden
-    /// muss. Schlägt das Öffnen oder Lesen fehl, kommt der Fehler zurück und die Datei fehlt
-    /// in der Sicherung; alles Übrige bleibt gültig, die Sicherung kann weiterlaufen.
+    /// muss. Schlägt das Öffnen oder Lesen fehl, kommt [`Error::Source`] zurück und die Datei
+    /// fehlt in der Sicherung; alles Übrige bleibt gültig, die Sicherung kann weiterlaufen.
     pub fn add_file<R: Read>(
         &mut self,
         path: &str,
@@ -172,7 +174,7 @@ impl<'a> SnapshotWriter<'a> {
             return Ok(FileOutcome::Reused);
         }
 
-        let (chunks, read) = self.store(open()?)?;
+        let (chunks, read) = self.store(open().map_err(Error::Source)?)?;
         // Die Datei kann sich seit dem Zählen geändert haben: Es gilt, was gelesen wurde.
         self.write_entry(&Entry { path: path.to_string(), kind: EntryKind::File, size: read, mtime, attrs, chunks })?;
         self.stats.files += 1;
@@ -186,7 +188,7 @@ impl<'a> SnapshotWriter<'a> {
         let mut total = 0u64;
         for chunk in Chunker::new(reader, self.sealer.chunker_seed()) {
             self.check()?;
-            let chunk = chunk?;
+            let chunk = chunk.map_err(Error::Source)?;
             total += chunk.len() as u64;
             self.progress.add(chunk.len() as u64);
             ids.push(self.queue(chunk)?);
@@ -252,7 +254,11 @@ impl<'a> SnapshotWriter<'a> {
         let tree_file = self.tree_file.open()?;
         // Die Dateiliste zählt nicht zum Fortschritt der Quelle.
         let progress = std::mem::replace(&mut self.progress, &NoProgress);
-        let (tree, _) = self.store(tree_file)?;
+        // Hier ist die „Quelle“ unsere eigene Zwischendatei: ein Lesefehler bricht ab.
+        let (tree, _) = self.store(tree_file).map_err(|error| match error {
+            Error::Source(error) => Error::Io(error),
+            other => other,
+        })?;
         self.progress = progress;
 
         let header = SnapshotHeader {
@@ -260,6 +266,7 @@ impl<'a> SnapshotWriter<'a> {
             created: meta.created,
             computer: meta.computer,
             user: meta.user,
+            profile_dir: meta.profile_dir,
             tool_version: meta.tool_version,
             encrypted: self.sealer.is_encrypted(),
             roots: meta.roots,

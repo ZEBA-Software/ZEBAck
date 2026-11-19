@@ -20,6 +20,9 @@ pub struct SnapshotHeader {
     pub created: String,
     pub computer: String,
     pub user: String,
+    /// Profilordner zum Zeitpunkt der Sicherung, z. B. `C:\Users\anna`
+    #[serde(default)]
+    pub profile_dir: String,
     pub tool_version: String,
     pub encrypted: bool,
     pub roots: Vec<Root>,
@@ -137,6 +140,7 @@ mod tests {
             created: "2026-11-19T09:30:00+01:00".into(),
             computer: "PC01".into(),
             user: "anna".into(),
+            profile_dir: "C:\\Users\\anna".into(),
             tool_version: "0.22.0".into(),
             encrypted: true,
             roots: vec![Root { name: "Dokumente".into(), original_path: "C:\\Users\\anna\\Documents".into(), kind: Some("documents".into()), files: 3, bytes: 99 }],

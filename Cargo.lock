@@ -4107,6 +4107,8 @@ dependencies = [
  "ureq",
  "walkdir",
  "winresource",
+ "zeback-format",
+ "zeback-remote",
  "zip",
 ]
 

@@ -16,6 +16,23 @@ cargo test -p zeback-format -p zeback-remote
 Die Tests, die beide Crates gegen einen laufenden Server prüfen, liegen im Repository von
 ZEBack Server (`crates/zeback-server/tests/client.rs`).
 
+Im Programm selbst verbindet `src/server.rs` die Crates mit Quellen, Fortschritt und
+Meldungen. Dessen Tests sichern gegen einen echten Server; sie laufen nur, wenn
+`ZEBACK_SERVER_BIN` auf das Programm von ZEBack Server zeigt, und tun sonst nichts:
+
+```bash
+ZEBACK_SERVER_BIN=../ZEBack-Server/target/debug/zeback-server cargo test server::
+```
+
+Unter Linux lässt sich das Programm zum Prüfen bauen, wenn `pkg-config` und `libssl-dev`
+installiert sind und die Fensterbibliothek eine Plattform bekommt:
+
+```bash
+cargo test --features eframe/x11
+```
+
+Einige ältere Tests setzen Windows voraus und schlagen unter Linux fehl.
+
 Änderungen am Blockformat brechen bestehende Sicherungen. `zeback-format` enthält dafür
 feste Prüfwerte (`chunker::tests::boundaries_are_part_of_the_format`); schlägt dieser Test
 fehl, darf die Änderung nur mit einer neuen Formatversion ausgeliefert werden.

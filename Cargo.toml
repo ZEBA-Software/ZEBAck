@@ -34,6 +34,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
 walkdir = "2.5.0"
+zeback-format = { path = "crates/zeback-format" }
+zeback-remote = { path = "crates/zeback-remote" }
 zip = { version = "9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs", "chrono", "aes-crypto"] }
 
 [build-dependencies]

@@ -92,6 +92,8 @@ pub enum TargetKind {
     S3,
     /// SFTP-Server (über den OpenSSH-Client von Windows)
     Sftp,
+    /// ZEBack Server: sichert in Blöcken statt als ZIP-Datei
+    Server,
 }
 
 impl TargetKind {
@@ -103,6 +105,7 @@ impl TargetKind {
             TargetKind::WebDav => "WebDAV",
             TargetKind::S3 => t!("S3-Speicher", "S3 storage"),
             TargetKind::Sftp => "SFTP",
+            TargetKind::Server => "ZEBack Server",
         }
     }
 
@@ -123,11 +126,12 @@ pub struct Target {
     /// Ordner (lokal) bzw. Freigabe mit Unterordner, z. B. `\\nas\backup\pc01`; S3: der Bucket;
     /// SFTP: die Schlüsseldatei (leer = Anmeldung mit Passwort)
     pub path: String,
-    /// Nextcloud, WebDAV, S3: Adresse des Servers
+    /// Nextcloud, WebDAV, S3, ZEBack Server: Adresse des Servers
     pub url: String,
     /// Anmeldename (SMB: optional, sonst gilt die Windows-Anmeldung); S3: Zugangsschlüssel
     pub user: String,
-    /// Nextcloud, WebDAV, S3: Ordner auf dem Server
+    /// Nextcloud, WebDAV, S3: Ordner auf dem Server; ZEBack Server: Name des Repositorys
+    /// (trägt das Koppeln ein, nur zur Anzeige)
     pub remote_dir: String,
     /// S3: Region des Buckets
     pub region: String,
@@ -150,6 +154,10 @@ impl Target {
             }
             TargetKind::Local | TargetKind::Smb => self.path.trim().to_string(),
             _ if self.url.trim().is_empty() => t!("noch keine Adresse", "no address yet").to_string(),
+            TargetKind::Server if self.remote_dir.trim().is_empty() => {
+                format!("{} · {}", crate::server::host(&self.url), t!("noch nicht gekoppelt", "not paired yet"))
+            }
+            TargetKind::Server => format!("{} / {}", crate::server::host(&self.url), self.remote_dir.trim()),
             TargetKind::Nextcloud | TargetKind::WebDav | TargetKind::Sftp => {
                 format!("{} / {}", self.url.trim().trim_start_matches("https://"), self.remote_dir.trim())
             }
@@ -167,7 +175,8 @@ impl Target {
         match self.kind {
             TargetKind::Local => false,
             TargetKind::Smb => !self.user.trim().is_empty(),
-            TargetKind::Nextcloud | TargetKind::WebDav | TargetKind::S3 => true,
+            // ZEBack Server: Das „Passwort“ ist das Token, das dieses Gerät beim Koppeln bekommt.
+            TargetKind::Nextcloud | TargetKind::WebDav | TargetKind::S3 | TargetKind::Server => true,
             // Mit Schlüsseldatei (steht in `path`) braucht SFTP kein Passwort.
             TargetKind::Sftp => self.path.trim().is_empty(),
         }
@@ -191,6 +200,9 @@ impl Target {
             }
             TargetKind::S3 if !user.is_empty() && !self.url.trim().is_empty() => {
                 Some(format!("s3:{user}@{}/{}", self.url.trim(), self.path.trim()))
+            }
+            TargetKind::Server if !self.url.trim().is_empty() => {
+                Some(format!("zeback-server:{}#{}", self.url.trim(), self.id))
             }
             _ => None,
         }
