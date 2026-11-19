@@ -29,9 +29,18 @@ pub struct ArchiveInfo {
     pub manifest: Option<Manifest>,
     /// Die Dateiinhalte sind verschlüsselt; zum Wiederherstellen wird das Passwort gebraucht.
     pub encrypted: bool,
+    /// Die Sicherung liegt nicht in einer ZIP-Datei, sondern auf einem ZEBack Server. `path`
+    /// ist dann nur ein Name für die Anzeige.
+    pub server: Option<crate::server::ServerSource>,
 }
 
 impl ArchiveInfo {
+    /// Verschlüsselte Sicherung auf einem ZEBack Server, die noch nicht mit dem Passwort
+    /// geöffnet wurde: Bis dahin ist nicht einmal bekannt, welche Ordner sie enthält.
+    pub fn is_locked(&self) -> bool {
+        self.server.is_some() && self.encrypted && self.manifest.is_none()
+    }
+
     /// Sicherung eines ganzen Laufwerks (statt einzelner Profilordner).
     pub fn is_drive_backup(&self) -> bool {
         self.manifest.as_ref().is_some_and(|m| m.roots.iter().any(|r| r.kind.as_deref() == Some("drive")))
@@ -219,7 +228,7 @@ pub fn inspect(path: &Path) -> Result<ArchiveInfo> {
     // Bei fremden ZIP-Dateien an den ersten Einträgen erkennen, ob verschlüsselt wurde.
     let encrypted = manifest.as_ref().is_some_and(|m| m.encrypted)
         || (0..archive.len().min(200)).any(|i| archive.by_index_data(i).is_ok_and(|e| e.encrypted()));
-    Ok(ArchiveInfo { path: path.to_path_buf(), size, entries: archive.len(), total_bytes, manifest, encrypted })
+    Ok(ArchiveInfo { path: path.to_path_buf(), size, entries: archive.len(), total_bytes, manifest, encrypted, server: None })
 }
 
 /// Prüft das Passwort einer verschlüsselten Sicherung, indem eine kleine Datei vollständig
@@ -519,6 +528,31 @@ fn extract_file(
     counter: &mut Counter,
     buf: &mut [u8],
 ) -> Result<u64> {
+    replace_file(target, modified, |out| {
+        let mut written = 0u64;
+        loop {
+            rep.check()?;
+            let n = match entry.read(buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(anyhow!(e).context(t!("Daten im Archiv beschädigt", "Data in the archive is damaged"))),
+            };
+            out.write_all(&buf[..n])?;
+            written += n as u64;
+            counter.add(n as u64);
+        }
+        Ok(written)
+    })
+}
+
+/// Legt eine Datei so an, dass eine vorhandene bei Abbruch oder Fehler unversehrt bleibt:
+/// `fill` schreibt in eine Nachbardatei; erst wenn es gelingt, ersetzt sie das Ziel.
+pub(crate) fn replace_file(
+    target: &Path,
+    modified: Option<SystemTime>,
+    fill: impl FnOnce(&mut BufWriter<File>) -> Result<u64>,
+) -> Result<u64> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -528,19 +562,7 @@ fn extract_file(
 
     let file = File::create(temp.path())?;
     let mut out = BufWriter::with_capacity(COPY_BUFFER, file);
-    let mut written = 0u64;
-    loop {
-        rep.check()?;
-        let n = match entry.read(buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(anyhow!(e).context(t!("Daten im Archiv beschädigt", "Data in the archive is damaged"))),
-        };
-        out.write_all(&buf[..n])?;
-        written += n as u64;
-        counter.add(n as u64);
-    }
+    let written = fill(&mut out)?;
     let file = out.into_inner().map_err(|e| anyhow!("{e}"))?;
     if let Some(time) = modified {
         let _ = file.set_modified(time);

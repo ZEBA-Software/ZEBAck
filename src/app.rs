@@ -125,6 +125,8 @@ enum Outcome {
     /// Das Ziel mit dieser Kennung ist mit einem ZEBack Server gekoppelt
     ServerPaired(u64, server::Paired),
     Inspected(ArchiveInfo),
+    /// Eine verschlüsselte Sicherung auf einem ZEBack Server ist mit diesem Passwort geöffnet
+    Unlocked(ArchiveInfo, String),
     Verified(VerifyReport),
     Image(ImageSummary),
 }
@@ -1256,6 +1258,24 @@ impl App {
                 }
                 (Level::Ok, text)
             }
+            Outcome::Unlocked(info, password) => {
+                // Jetzt ist der Inhalt bekannt: Ordner anhaken und die passende Art vorschlagen.
+                self.forget_file_selection();
+                self.chain = None;
+                self.root_checked = vec![true; info.manifest.as_ref().map_or(0, |m| m.roots.len())];
+                self.restore_mode = if info.fits_profile() {
+                    RestoreMode::Profile
+                } else if info.is_files_backup() {
+                    RestoreMode::Original
+                } else {
+                    RestoreMode::Folder
+                };
+                self.archive = Some(info);
+                self.restore_password_ok = Some(password);
+                self.switch_tab(Tab::Restore);
+                self.go_to_step(1);
+                (Level::Ok, t!("Sicherung geöffnet\nDas Passwort stimmt.", "Backup opened\nThe password is correct.").to_string())
+            }
         }
     }
 
@@ -2038,6 +2058,25 @@ impl App {
         if !info.encrypted {
             return Ok(());
         }
+        if info.server.is_some() {
+            // Auf dem Server wird das Passwort beim Öffnen geprüft ("Weiter" im ersten Schritt).
+            let locked = info.is_locked();
+            return if locked {
+                Err(t!(
+                    "Sicherung noch verschlossen\nGib im ersten Schritt das Passwort ein und wähle „Weiter“.",
+                    "Backup still locked\nEnter the password in the first step and choose “Next”."
+                )
+                .to_string())
+            } else if self.restore_password_ok.as_deref() == Some(self.restore_password.as_str()) {
+                Ok(())
+            } else {
+                Err(t!(
+                    "Passwort geändert\nDie Sicherung wurde mit einem anderen Passwort geöffnet. Trage wieder dieses ein.",
+                    "Password changed\nThe backup was opened with a different password. Enter that one again."
+                )
+                .to_string())
+            };
+        }
         if self.restore_password.is_empty() {
             return Err(t!(
                 "Passwort fehlt\nDiese Sicherung ist verschlüsselt. Bitte das Passwort eingeben.",
@@ -2119,6 +2158,10 @@ impl App {
 
     /// "Weiter" bzw. "Wiederherstellen" im Wiederherstellen-Ablauf.
     fn restore_next(&mut self) {
+        // Verschlüsselte Sicherung auf einem ZEBack Server: erst mit dem Passwort öffnen.
+        if self.restore_step == 0 && self.archive.as_ref().is_some_and(ArchiveInfo::is_locked) {
+            return self.start_unlock();
+        }
         let check = match self.restore_step {
             0 => self.check_restore_archive().map(|_| ()).and_then(|_| self.check_restore_password()),
             1 => self.check_restore_selection(),
@@ -2163,14 +2206,16 @@ impl App {
         }
         let replace = self.whole_replacements(info);
         let job = RestoreJob { archive: info.path.clone(), mapping, conflict: self.conflict, total_bytes, password, only };
+        let source = info.server.clone();
         // Teilsicherung mit vollständiger Kette: Vollsicherung und Teilsicherungen zusammenführen.
         let chain = self.chain.clone();
         self.start(t!("Wiederherstellung", "Restore"), move |rep| {
             // Browser und Mailprogramm zuerst beiseiteschieben: Sie kommen komplett aus der Sicherung.
             let aside = restore::set_aside(&replace, rep)?;
-            let result = match &chain {
-                Some(chain) => restore::run_chain(chain, &job, rep),
-                None => restore::run(&job, rep),
+            let result = match (&source, &chain) {
+                (Some(source), _) => server::restore(&job, source, rep),
+                (None, Some(chain)) => restore::run_chain(chain, &job, rep),
+                (None, None) => restore::run(&job, rep),
             };
             if result.is_err() {
                 for moved in &aside {
@@ -2205,6 +2250,20 @@ impl App {
 
     /// Prüft die geöffnete Sicherung, ohne etwas wiederherzustellen.
     fn start_verify(&mut self) {
+        // Auf einem ZEBack Server: Das Prüfen öffnet die Sicherung selbst mit dem Passwort.
+        if let Some(info) = self.archive.as_ref().filter(|info| info.server.is_some()) {
+            if info.encrypted && self.restore_password.is_empty() {
+                return self.fail(t!(
+                    "Passwort fehlt\nDiese Sicherung ist verschlüsselt. Bitte das Passwort eingeben.",
+                    "Password missing\nThis backup is encrypted. Please enter the password."
+                ));
+            }
+            let Some(source) = info.server.clone() else { return };
+            let password = self.restore_password_option();
+            return self.start(t!("Sicherung wird geprüft", "Verifying backup"), move |rep| {
+                server::verify(&source, password.as_deref(), rep).map(Outcome::Verified)
+            });
+        }
         if let Err(message) = self.check_restore_password() {
             return self.fail(message);
         }
@@ -2218,6 +2277,35 @@ impl App {
 
     fn open_archive(&mut self, path: PathBuf) {
         self.start(t!("Sicherung wird geöffnet", "Opening backup"), move |_| restore::inspect(&path).map(Outcome::Inspected));
+    }
+
+    /// Öffnet eine Sicherung, die auf einem ZEBack Server liegt. Ist sie verschlüsselt, kommt
+    /// zunächst nur das zurück, was der Server ohne Passwort weiß.
+    fn open_snapshot(&mut self, target_id: u64, snapshot: server::ServerSnapshot) {
+        let Some(target) = self.cfg.targets.iter().find(|t| t.id == target_id) else { return };
+        let source = server::ServerSource {
+            login: server::ServerLogin { url: target.url.trim().to_string(), token: self.target_password(target) },
+            target_name: target.name.clone(),
+            snapshot,
+        };
+        self.start(t!("Sicherung wird geöffnet", "Opening backup"), move |_| server::inspect(&source, None).map(Outcome::Inspected));
+    }
+
+    /// Öffnet die verschlossene Sicherung mit dem eingegebenen Passwort. Stimmt es, geht es
+    /// gleich weiter zum nächsten Schritt.
+    fn start_unlock(&mut self) {
+        let Some(source) = self.archive.as_ref().and_then(|info| info.server.clone()) else { return };
+        if self.restore_password.is_empty() {
+            return self.fail(t!(
+                "Passwort fehlt\nDiese Sicherung ist verschlüsselt. Bitte das Passwort eingeben.",
+                "Password missing\nThis backup is encrypted. Please enter the password."
+            ));
+        }
+        let password = self.restore_password.clone();
+        self.start(t!("Sicherung wird geöffnet", "Opening backup"), move |_| {
+            let info = server::inspect(&source, Some(&password))?;
+            Ok(Outcome::Unlocked(info, password))
+        });
     }
 
     /// Sucht auf allen Sicherungszielen (Ordner, Freigaben, Nextcloud) nach Sicherungen.
@@ -2249,6 +2337,12 @@ impl App {
             return;
         }
         let Some(info) = &self.archive else { return };
+        if let Some(source) = info.server.clone() {
+            let password = self.restore_password_option();
+            return self.start(t!("Inhalt der Sicherung wird gelesen", "Reading backup contents"), move |_| {
+                server::list_entries(&source, password.as_deref()).map(|entries| Outcome::Listed(Tree::build(&entries)))
+            });
+        }
         let path = info.path.clone();
         self.start(t!("Inhalt der Sicherung wird gelesen", "Reading backup contents"), move |_| {
             restore::list_entries(&path).map(|entries| Outcome::Listed(Tree::build(&entries)))
@@ -4069,7 +4163,7 @@ impl App {
         widgets::card(ui, |ui| {
             let name = info.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             ui.horizontal(|ui| {
-                widgets::inline_icon(ui, Icon::Zip, 16.0, ACCENT);
+                widgets::inline_icon(ui, if info.server.is_some() { Icon::Backup } else { Icon::Zip }, 16.0, ACCENT);
                 ui.add(egui::Label::new(RichText::new(name).font(theme::bold(15.0)).color(TEXT_BRIGHT)).truncate());
             });
             ui.add(
@@ -4096,12 +4190,26 @@ impl App {
                     widgets::kv_row(ui, t!("Computer", "Computer"), &manifest.computer);
                     widgets::kv_row(ui, t!("Ordner", "Folders"), &manifest.roots.len().to_string());
                 }
+            } else if let Some(source) = &info.server {
+                // Noch verschlossen: nur das, was der Server ohne Passwort weiß.
+                let received = DateTime::from_timestamp(source.snapshot.received_at, 0)
+                    .map(|time| time.with_timezone(&Local).format("%d.%m.%Y, %H:%M").to_string())
+                    .unwrap_or_default();
+                widgets::kv_row(ui, t!("Erstellt", "Created"), &received);
+                widgets::kv_row(ui, t!("Profil", "Profile"), &source.snapshot.user);
+                widgets::kv_row(ui, t!("Computer", "Computer"), &source.snapshot.computer);
             } else {
                 widgets::kv_row(ui, t!("Herkunft", "Origin"), t!("nicht von ZEBack", "not from ZEBack"));
             }
-            widgets::kv_row(ui, t!("ZIP-Größe", "ZIP size"), &fmt_bytes(info.size));
-            widgets::kv_row(ui, t!("Entpackt", "Extracted"), &fmt_bytes(info.total_bytes));
-            widgets::kv_row(ui, t!("Einträge", "Entries"), &info.entries.to_string());
+            if let Some(source) = &info.server {
+                widgets::kv_row(ui, t!("Ziel", "Target"), &source.target_name);
+                widgets::kv_row(ui, t!("Größe", "Size"), &fmt_bytes(info.total_bytes));
+                widgets::kv_row(ui, t!("Dateien", "Files"), &info.entries.to_string());
+            } else {
+                widgets::kv_row(ui, t!("ZIP-Größe", "ZIP size"), &fmt_bytes(info.size));
+                widgets::kv_row(ui, t!("Entpackt", "Extracted"), &fmt_bytes(info.total_bytes));
+                widgets::kv_row(ui, t!("Einträge", "Entries"), &info.entries.to_string());
+            }
             widgets::kv_row(ui, t!("Verschlüsselt", "Encrypted"), if info.encrypted { t!("ja", "yes") } else { t!("nein", "no") });
             if let Some(manifest) = info.manifest.as_ref().filter(|m| m.incremental) {
                 // Teilsicherung: erklären, was beim Wiederherstellen passiert.
@@ -5960,8 +6068,8 @@ impl App {
                 widgets::text(
                     ui,
                     t!(
-                        "Die neueste steht oben. Sicherungen aus der Cloud werden erst heruntergeladen.",
-                        "The newest is at the top. Backups from the cloud are downloaded first."
+                        "Die neueste steht oben. Sicherungen aus der Cloud werden erst heruntergeladen; von einem ZEBack Server kommen sie direkt zurück.",
+                        "The newest is at the top. Backups from the cloud are downloaded first; from a ZEBack Server they come back directly."
                     ),
                     theme::regular(12.5),
                     TEXT_MUTED,
@@ -5977,7 +6085,8 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    widgets::inline_icon(ui, Icon::Zip, 16.0, ACCENT);
+                                    let icon = if matches!(file.place, Place::Server(_)) { Icon::Backup } else { Icon::Zip };
+                                    widgets::inline_icon(ui, icon, 16.0, ACCENT);
                                     let width = (ui.available_width() - 170.0).max(120.0);
                                     ui.vertical(|ui| {
                                         ui.set_width(width);
@@ -5996,6 +6105,7 @@ impl App {
                                             let (label, icon) = match file.place {
                                                 Place::File(_) => (t!("Öffnen", "Open"), Icon::OpenFile),
                                                 Place::Cloud(_) => (t!("Laden", "Download"), Icon::Downloads),
+                                                Place::Server(_) => (t!("Öffnen", "Open"), Icon::Backup),
                                             };
                                             if widgets::button(ui, label, Kind::Primary, Some(icon)).clicked() {
                                                 chosen = Some(file.clone());
@@ -6019,6 +6129,10 @@ impl App {
                 self.open_archive(path);
             }
             Some(FoundBackup { place: Place::Cloud(file), target_id, .. }) => self.start_download(target_id, file),
+            Some(FoundBackup { place: Place::Server(snapshot), target_id, .. }) => {
+                self.found_backups = None;
+                self.open_snapshot(target_id, snapshot);
+            }
             None if close || modal.should_close() => self.found_backups = None,
             None => {}
         }

@@ -157,6 +157,8 @@ pub enum Place {
     File(PathBuf),
     /// Auf einer Nextcloud; muss erst heruntergeladen werden
     Cloud(RemoteFile),
+    /// Auf einem ZEBack Server; wird von dort direkt wiederhergestellt
+    Server(crate::server::ServerSnapshot),
 }
 
 /// Eine Sicherung auf einem der Sicherungsziele.
@@ -197,8 +199,13 @@ pub fn find_backups(targets: &[(Target, String)], rep: &Reporter) -> Vec<FoundBa
                         .map(|file| hit(file.name.clone(), file.size, file.modified, Place::Cloud(file)))
                         .collect())
                 }
-                // Auf ZEBack Server liegen keine ZIP-Dateien.
-                Destination::Server { .. } => Ok(Vec::new()),
+                Destination::Server { login, .. } => Ok(crate::server::list(&login)?
+                    .into_iter()
+                    .map(|snapshot| {
+                        let modified = DateTime::from_timestamp(snapshot.received_at, 0).map(|time| time.with_timezone(&Local));
+                        hit(snapshot.label(), snapshot.bytes, modified, Place::Server(snapshot))
+                    })
+                    .collect()),
                 Destination::Folder { path, login, .. } => {
                     if let Some(login) = &login {
                         crate::smb::connect(&path.to_string_lossy(), &login.user, &login.password)?;

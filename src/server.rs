@@ -11,15 +11,17 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local};
-use zeback_remote::{Progress, RepoInfo, Root, Sealer, ServerClient, SnapshotInfo, SnapshotMeta, SnapshotWriter};
+use zeback_remote::{EntryKind, Progress, RepoInfo, Root, Sealer, ServerClient, SnapshotInfo, SnapshotMeta, SnapshotReader, SnapshotWriter};
 
-use crate::backup::{self, BackupJob, Source};
+use crate::backup::{self, BackupJob, Manifest, ManifestRoot, Source};
 use crate::job::{Cancelled, Reporter};
+use crate::restore::{self, ArchiveInfo, Conflict, Mapping, RestoreJob, RestoreSummary};
 use crate::util::fmt_bytes;
+use crate::verify::VerifyReport;
 
 /// Adresse des Servers und das Token, das dieses Gerät beim Koppeln bekommen hat.
 #[derive(Clone)]
@@ -374,6 +376,260 @@ pub fn open_named(name: &str, login: &ServerLogin, password: Option<&str>, rep: 
     open(login, password, rep).with_context(|| tr!("Ziel „{name}“", "Target “{name}”"))
 }
 
+// ---------------------------------------------------------------------------- Wiederherstellen
+
+/// Eine Sicherung auf einem ZEBack Server, wie die Suche sie findet. Diese Angaben nennt der
+/// Server auch ohne Passwort; Ordner und Dateinamen gehören nicht dazu.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerSnapshot {
+    pub id: i64,
+    /// Kennung des Blocks mit dem Kopf der Sicherung
+    pub header: zeback_remote::ChunkId,
+    pub computer: String,
+    pub user: String,
+    pub files: u64,
+    pub bytes: u64,
+    /// Eingang auf dem Server, Sekunden seit 1970
+    pub received_at: i64,
+}
+
+impl ServerSnapshot {
+    /// Name in der Liste der gefundenen Sicherungen, z. B. `PC01 · anna · 4812 Dateien`.
+    pub fn label(&self) -> String {
+        let files = tr!("{} Dateien", "{} files", self.files);
+        let who: Vec<&str> = [self.computer.as_str(), self.user.as_str()].into_iter().filter(|part| !part.is_empty()).collect();
+        if who.is_empty() { files } else { format!("{} · {files}", who.join(" · ")) }
+    }
+}
+
+/// Woher eine geöffnete Sicherung kommt, wenn sie auf einem ZEBack Server liegt.
+#[derive(Clone, Debug)]
+pub struct ServerSource {
+    pub login: ServerLogin,
+    /// Name des Sicherungsziels
+    pub target_name: String,
+    pub snapshot: ServerSnapshot,
+}
+
+/// Die Sicherungen des Repositorys, neueste zuerst.
+pub fn list(login: &ServerLogin) -> Result<Vec<ServerSnapshot>> {
+    let client = ServerClient::new(crate::nextcloud::new_agent(), &login.url, login.token.clone());
+    Ok(client
+        .snapshots()
+        .map_err(explain)?
+        .into_iter()
+        .map(|snapshot| ServerSnapshot {
+            id: snapshot.id,
+            header: snapshot.header,
+            computer: snapshot.computer,
+            user: snapshot.user,
+            files: snapshot.files,
+            bytes: snapshot.bytes,
+            received_at: snapshot.received_at,
+        })
+        .collect())
+}
+
+/// Verbindet sich zum Lesen. Anders als beim Sichern wird hier nie ein Schlüssel angelegt.
+fn open_for_reading(login: &ServerLogin, password: Option<&str>) -> Result<Ready> {
+    let client = ServerClient::new(crate::nextcloud::new_agent(), &login.url, login.token.clone());
+    let repo = client.repo().map_err(explain)?;
+    if repo.encrypted && repo.key.is_none() {
+        anyhow::bail!(t!(
+            "In diesem Repository liegt noch kein Schlüssel. Es enthält keine Sicherung, die sich öffnen ließe.",
+            "There is no key in this repository yet. It contains no backup that could be opened."
+        ));
+    }
+    if repo.encrypted && password.is_none_or(str::is_empty) {
+        anyhow::bail!(t!(
+            "Diese Sicherung ist verschlüsselt. Bitte das Passwort eingeben.",
+            "This backup is encrypted. Please enter the password."
+        ));
+    }
+    let sealer = zeback_remote::open_sealer(&client, &repo, password).map_err(explain)?;
+    Ok(Ready { client, repo, sealer })
+}
+
+/// Öffnet eine Sicherung auf dem Server und beschreibt sie so, wie die Wiederherstellung es
+/// von einer ZIP-Datei kennt.
+///
+/// Ist das Repository verschlüsselt und kein Passwort angegeben, kommt eine „verschlossene“
+/// Beschreibung zurück ([`ArchiveInfo::is_locked`]): Sie nennt nur, was der Server ohne
+/// Passwort weiß. Mit dem Passwort noch einmal aufgerufen, kommt der ganze Inhalt.
+pub fn inspect(source: &ServerSource, password: Option<&str>) -> Result<ArchiveInfo> {
+    let client = ServerClient::new(crate::nextcloud::new_agent(), &source.login.url, source.login.token.clone());
+    let repo = client.repo().map_err(explain)?;
+    let snapshot = &source.snapshot;
+    let path = std::path::PathBuf::from(format!(
+        "{}/{}/{}",
+        host(client.base_url()),
+        repo.name,
+        tr!("Sicherung Nr. {}", "Backup no. {}", snapshot.id)
+    ));
+    let mut info = ArchiveInfo {
+        path,
+        size: 0,
+        entries: snapshot.files as usize,
+        total_bytes: snapshot.bytes,
+        manifest: None,
+        encrypted: repo.encrypted,
+        server: Some(source.clone()),
+    };
+    if repo.encrypted && password.is_none_or(str::is_empty) {
+        return Ok(info);
+    }
+
+    let ready = open_for_reading(&source.login, password)?;
+    let reader = SnapshotReader::open(&ready.client, &ready.sealer, snapshot.header).map_err(explain)?;
+    let header = &reader.header;
+    info.entries = header.files as usize;
+    info.total_bytes = header.bytes;
+    info.manifest = Some(Manifest {
+        format: 1,
+        created: header.created.clone(),
+        computer: header.computer.clone(),
+        user: header.user.clone(),
+        profile_dir: header.profile_dir.clone(),
+        encrypted: header.encrypted,
+        tool_version: header.tool_version.clone(),
+        roots: header
+            .roots
+            .iter()
+            .map(|root| ManifestRoot {
+                name: root.name.clone(),
+                original_path: root.original_path.clone(),
+                kind: root.kind.clone(),
+                files: root.files,
+                bytes: root.bytes,
+            })
+            .collect(),
+        // Auf dem Server ist jede Sicherung vollständig; Ketten aus Teilsicherungen gibt es nicht.
+        incremental: false,
+        base: None,
+    });
+    Ok(info)
+}
+
+/// Die Dateien der Sicherung, für die Baumansicht zum Auswählen.
+pub fn list_entries(source: &ServerSource, password: Option<&str>) -> Result<Vec<restore::Entry>> {
+    let ready = open_for_reading(&source.login, password)?;
+    let reader = SnapshotReader::open(&ready.client, &ready.sealer, source.snapshot.header).map_err(explain)?;
+    let mut entries = Vec::new();
+    for entry in reader.entries().map_err(explain)? {
+        let entry = entry.map_err(explain)?;
+        if entry.kind == EntryKind::File {
+            entries.push(restore::Entry { path: entry.path, size: entry.size });
+        }
+    }
+    Ok(entries)
+}
+
+/// Liest die ganze Sicherung vom Server und prüft jeden Block.
+pub fn verify(source: &ServerSource, password: Option<&str>, rep: &Reporter) -> Result<VerifyReport> {
+    let ready = open_for_reading(&source.login, password)?;
+    let reader = SnapshotReader::open(&ready.client, &ready.sealer, source.snapshot.header).map_err(explain)?;
+    rep.status(t!("Sicherung wird geprüft …", "Verifying backup …"));
+    let meter = Meter::new(rep, reader.header.bytes);
+    let report = reader.verify(&meter).map_err(|error| match error {
+        zeback_remote::Error::Format(_) | zeback_remote::Error::Protocol(_) => explain(error).context(t!(
+            "Die Sicherung auf dem Server ist beschädigt",
+            "The backup on the server is damaged"
+        )),
+        other => explain(other),
+    })?;
+    rep.progress(reader.header.bytes, reader.header.bytes);
+    Ok(VerifyReport { files: report.files, bytes: report.bytes })
+}
+
+/// Holt eine Sicherung vom Server zurück – mit denselben Regeln wie [`restore::run`] für
+/// ZIP-Dateien: Zuordnung der Ordner, Auswahl einzelner Dateien, Umgang mit Vorhandenem.
+pub fn restore(job: &RestoreJob, source: &ServerSource, rep: &Reporter) -> Result<RestoreSummary> {
+    let started = Instant::now();
+    let ready = open_for_reading(&source.login, job.password.as_deref())?;
+    let reader = SnapshotReader::open(&ready.client, &ready.sealer, source.snapshot.header).map_err(explain)?;
+
+    let mut summary = RestoreSummary { restored: 0, bytes: 0, skipped_existing: 0, failed: 0, duration: Duration::ZERO };
+    let meter = Meter::new(rep, job.total_bytes);
+    rep.status(t!("Dateien werden wiederhergestellt …", "Restoring files …"));
+
+    for entry in reader.entries().map_err(explain)? {
+        rep.check()?;
+        let entry = entry.map_err(explain)?;
+        // Die Dateiliste kommt vom Server: Kein Eintrag darf aus dem Zielordner hinausführen.
+        let Some(rel) = zeback_remote::safe_relative_path(&entry.path) else {
+            rep.warn(tr!("Unsicherer Pfad in der Sicherung übersprungen: {}", "Skipped unsafe path in the backup: {}", entry.path));
+            summary.failed += 1;
+            continue;
+        };
+        // Bei einer Auswahl einzelner Dateien alles andere auslassen.
+        if let Some(only) = &job.only
+            && !restore::is_selected(only, &entry.path)
+        {
+            continue;
+        }
+        let target = match &job.mapping {
+            Mapping::Everything(dest) => dest.join(&rel),
+            Mapping::Roots(roots) => {
+                let mut components = rel.components();
+                let Some(first) = components.next() else { continue };
+                // Nicht ausgewählte Ordner auslassen.
+                let Some(dest) = roots.get(first.as_os_str().to_string_lossy().as_ref()) else { continue };
+                let rest = components.as_path();
+                // Eine einzeln gesicherte Datei liegt auf der obersten Ebene: Ihr Ziel ist dann
+                // schon der ganze Dateipfad.
+                if rest.as_os_str().is_empty() { dest.clone() } else { dest.join(rest) }
+            }
+        };
+
+        if entry.kind == EntryKind::Dir {
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                rep.warn(tr!("Ordner kann nicht angelegt werden: {} ({e})", "Cannot create folder: {} ({e})", target.display()));
+                summary.failed += 1;
+            }
+            continue;
+        }
+        if job.conflict == Conflict::Skip && target.exists() {
+            summary.skipped_existing += 1;
+            meter.add(entry.size);
+            continue;
+        }
+
+        let modified = u64::try_from(entry.mtime).ok().filter(|secs| *secs > 0).map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        let mut fatal = None;
+        let written = restore::replace_file(&target, modified, |out| {
+            match reader.restore_file(&entry, out, &meter) {
+                Ok(()) => Ok(entry.size),
+                // Beschädigter Block oder Schreibfehler: Diese Datei fehlt, die übrigen gehen weiter.
+                Err(error @ (zeback_remote::Error::Format(_) | zeback_remote::Error::Protocol(_) | zeback_remote::Error::Io(_))) => {
+                    Err(anyhow!(error))
+                }
+                // Abbruch, Server nicht erreichbar, Zugang entzogen: Weitermachen hat keinen Sinn.
+                Err(error) => {
+                    fatal = Some(explain(error));
+                    Err(anyhow!(Cancelled))
+                }
+            }
+        });
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+        match written {
+            Ok(bytes) => {
+                summary.restored += 1;
+                summary.bytes += bytes;
+            }
+            Err(e) => {
+                rep.warn(tr!("Nicht wiederhergestellt: {} ({e:#})", "Not restored: {} ({e:#})", target.display()));
+                summary.failed += 1;
+            }
+        }
+    }
+
+    rep.progress(job.total_bytes, job.total_bytes);
+    summary.duration = started.elapsed();
+    Ok(summary)
+}
+
 /// Diese Tests brauchen einen echten ZEBack Server. Sie laufen nur, wenn die
 /// Umgebungsvariable `ZEBACK_SERVER_BIN` auf dessen Programm zeigt; sonst tun sie nichts.
 #[cfg(test)]
@@ -656,5 +912,161 @@ mod tests {
         let text = describe(&login).unwrap();
         assert!(text.contains("Repository „anzeige“") && text.contains("verschlüsselt") && text.contains("14 Tage"), "{text}");
         assert!(pair(&live.url, "AAAA-BBBB-CCCC-DDDD").is_err());
+    }
+
+    fn target_of(login: &ServerLogin) -> (Target, String) {
+        let target =
+            Target { id: 1, name: "Server".into(), kind: TargetKind::Server, url: login.url.clone(), ..Target::default() };
+        (target, login.token.clone())
+    }
+
+    /// Inhalt eines Ordners: Pfad → Dateiinhalt (`None` für Ordner).
+    fn contents(dir: &Path) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(dir)
+            .min_depth(1)
+            .into_iter()
+            .map(Result::unwrap)
+            .map(|entry| {
+                let name = entry.path().strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/");
+                (name, entry.file_type().is_file().then(|| fs::read(entry.path()).unwrap()))
+            })
+            .collect()
+    }
+
+    /// Daten, die sich nicht komprimieren lassen.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finds_opens_restores_and_verifies_backups_on_a_server() {
+        use std::collections::{HashMap, HashSet};
+
+        let Some(live) = Live::start("zurueck") else { return };
+        let source = live.dir.join("quelle");
+        sample(&source);
+        fs::write(source.join("rauschen.bin"), noise(400_000)).unwrap();
+        let login = live.login("zurueck", true, 0);
+        logged(|rep| backup::run(&job(&source, vec![server(&login)], Some(PASSWORD)), rep)).0.unwrap();
+
+        // Die Suche findet die Sicherung auf dem Server.
+        let (found, _) = logged(|rep| jobs::find_backups(&[target_of(&login)], rep));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].name.contains("anna") && found[0].name.ends_with("5 Dateien"), "{}", found[0].name);
+        assert_eq!(found[0].target_name, "Server");
+        assert!(found[0].modified.is_some() && found[0].size > 400_000);
+        let jobs::Place::Server(snapshot) = found[0].place.clone() else { panic!("kein Server-Fund") };
+        let from = ServerSource { login: login.clone(), target_name: "Server".into(), snapshot };
+
+        // Ohne Passwort ist die Sicherung verschlossen: Der Server verrät nur Zahlen.
+        let locked = inspect(&from, None).unwrap();
+        assert!(locked.is_locked() && locked.encrypted && locked.manifest.is_none());
+        assert_eq!((locked.entries, locked.size), (5, 0));
+        assert!(!locked.fits_profile());
+        let wrong = format!("{:#}", inspect(&from, Some("ein falsches Passwort")).unwrap_err());
+        assert!(wrong.contains("Passwort passt nicht"), "{wrong}");
+
+        // Mit Passwort: Ordner, Profil und Dateiliste sind da.
+        let info = inspect(&from, Some(PASSWORD)).unwrap();
+        assert!(!info.is_locked());
+        let manifest = info.manifest.as_ref().unwrap();
+        assert_eq!((manifest.user.as_str(), manifest.roots.len(), manifest.incremental), ("anna", 1, false));
+        assert_eq!((manifest.roots[0].name.as_str(), manifest.roots[0].files), ("quelle", 5));
+        assert_eq!(manifest.profile_dir, source.to_string_lossy());
+        assert!(restore::chain_for(&info).is_none());
+        assert_eq!(info.path.file_name().unwrap().to_string_lossy(), format!("Sicherung Nr. {}", from.snapshot.id));
+        assert!(info.path.parent().unwrap().to_string_lossy().ends_with("/zurueck"));
+
+        let entries = list_entries(&from, Some(PASSWORD)).unwrap();
+        assert_eq!(entries.len(), 5);
+        let tree = restore::Tree::build(&entries);
+        let top: Vec<&str> = tree.children("quelle").iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(top, ["Unterordner", "Brief.txt", "leer.txt", "rauschen.bin"]);
+        assert!(list_entries(&from, None).is_err());
+
+        // Alles zurück in einen Ordner.
+        let target = live.dir.join("zurueck");
+        let all = |conflict| RestoreJob {
+            archive: info.path.clone(),
+            mapping: Mapping::Roots(HashMap::from([("quelle".to_string(), target.clone())])),
+            conflict,
+            total_bytes: info.total_bytes,
+            password: Some(PASSWORD.into()),
+            only: None,
+        };
+        let (summary, log) = logged(|rep| restore(&all(Conflict::Overwrite), &from, rep));
+        let summary = summary.unwrap();
+        assert_eq!((summary.restored, summary.failed, summary.skipped_existing), (5, 0, 0), "{log}");
+        assert_eq!(contents(&target), contents(&source));
+        // Auch die Änderungszeit kommt zurück.
+        let modified = |path: &Path| backup::file_stamp(&fs::metadata(path).unwrap()).1;
+        fs::File::options().write(true).open(source.join("leer.txt")).unwrap().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_000)).unwrap();
+        logged(|rep| backup::run(&job(&source, vec![server(&login)], Some(PASSWORD)), rep)).0.unwrap();
+        let newest = ServerSource { snapshot: list(&login).unwrap().remove(0), ..from.clone() };
+        logged(|rep| restore(&all(Conflict::Overwrite), &newest, rep)).0.unwrap();
+        assert_eq!(modified(&target.join("leer.txt")), 1_600_000_000);
+
+        // Vorhandenes behalten: Eine lokal geänderte Datei wird nicht überschrieben.
+        fs::write(target.join("Brief.txt"), "lokal geändert").unwrap();
+        let (summary, _) = logged(|rep| restore(&all(Conflict::Skip), &from, rep));
+        let summary = summary.unwrap();
+        assert_eq!((summary.restored, summary.skipped_existing), (0, 5));
+        assert_eq!(fs::read_to_string(target.join("Brief.txt")).unwrap(), "lokal geändert");
+
+        // Nur ein ausgewählter Unterordner, an einen frei gewählten Ort.
+        let elsewhere = live.dir.join("auswahl");
+        let picked = RestoreJob {
+            mapping: Mapping::Everything(elsewhere.clone()),
+            only: Some(HashSet::from(["quelle/Unterordner".to_string()])),
+            ..all(Conflict::Overwrite)
+        };
+        let summary = logged(|rep| restore(&picked, &from, rep)).0.unwrap();
+        assert_eq!(summary.restored, 2);
+        let got: Vec<String> = contents(&elsewhere).into_keys().collect();
+        assert_eq!(got, ["quelle", "quelle/Unterordner", "quelle/Unterordner/Größe – Übersicht.txt", "quelle/Unterordner/daten.bin", "quelle/Unterordner/leer"]);
+
+        // Falsches Passwort beim Wiederherstellen: nichts wird angefasst.
+        let untouched = live.dir.join("unberuehrt");
+        let bad = RestoreJob { mapping: Mapping::Everything(untouched.clone()), password: Some("ein falsches Passwort".into()), ..all(Conflict::Overwrite) };
+        assert!(logged(|rep| restore(&bad, &from, rep)).0.is_err());
+        assert!(!untouched.exists());
+
+        // Prüfen liest alles vom Server.
+        let report = logged(|rep| verify(&from, Some(PASSWORD), rep)).0.unwrap();
+        assert_eq!((report.files, report.bytes), (5, info.total_bytes));
+
+        // Ein gekipptes Bit im größten Pack (mitten in rauschen.bin): Prüfen schlägt Alarm,
+        // Wiederherstellen holt alles Übrige zurück und hinterlässt keine halbe Datei.
+        let pack = walkdir::WalkDir::new(live.dir.join("volumes"))
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+            .max_by_key(|entry| entry.metadata().unwrap().len())
+            .unwrap()
+            .into_path();
+        let mut bytes = fs::read(&pack).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        fs::write(&pack, bytes).unwrap();
+
+        let damaged = format!("{:#}", logged(|rep| verify(&from, Some(PASSWORD), rep)).0.unwrap_err());
+        assert!(damaged.contains("beschädigt"), "{damaged}");
+        let rescue = live.dir.join("rettung");
+        let rescue_job = RestoreJob { mapping: Mapping::Everything(rescue.clone()), ..all(Conflict::Overwrite) };
+        let (summary, log) = logged(|rep| restore(&rescue_job, &from, rep));
+        let summary = summary.unwrap();
+        assert_eq!((summary.restored, summary.failed), (4, 1), "{log}");
+        assert!(log.contains("Nicht wiederhergestellt") && log.contains("rauschen.bin"), "{log}");
+        let rescued: Vec<String> = contents(&rescue).into_keys().collect();
+        assert!(!rescued.iter().any(|name| name.contains("rauschen") || name.ends_with(".pbtmp")), "{rescued:?}");
+        assert_eq!(fs::read(rescue.join("quelle/Unterordner/daten.bin")).unwrap(), vec![7u8; 700_000]);
     }
 }
