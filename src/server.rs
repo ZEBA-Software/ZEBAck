@@ -76,16 +76,16 @@ fn explain(error: zeback_remote::Error) -> anyhow::Error {
     match error {
         Error::Cancelled => anyhow!(Cancelled),
         ref unauthorized if unauthorized.is_unauthorized() => anyhow!(t!(
-            "Der Server kennt dieses Gerät nicht (mehr). Bitte unter „Sicherungsziele“ neu koppeln.",
-            "The server does not know this device (any more). Please pair it again under “Backup targets”."
+            "Der Server kennt dieses Gerät nicht (mehr). Bitte unter „Sicherungsziele“ neu verbinden.",
+            "The server does not know this device (any more). Please connect it again under “Backup targets”."
         )),
         ref wrong if wrong.is_wrong_password() => anyhow!(t!(
-            "Das Passwort passt nicht zu diesem Repository. Es gilt das Passwort, mit dem zum ersten Mal dorthin gesichert wurde.",
-            "The password does not match this repository. Use the password of the first backup made to it."
+            "Das Passwort passt nicht zu diesem Tresor. Es gilt das Passwort der ersten Sicherung dorthin.",
+            "The password does not match this vault. Use the password of the first backup made to it."
         )),
         Error::PasswordRequired => anyhow!(t!(
-            "Dieses Repository ist verschlüsselt. Schalte beim Sichern „Mit Passwort verschlüsseln“ ein und gib das Passwort an.",
-            "This repository is encrypted. Turn on “Encrypt with password” for the backup and enter the password."
+            "Dieser Tresor ist verschlüsselt. Schalte beim Sichern „Mit Passwort verschlüsseln“ ein und gib das Passwort an.",
+            "This vault is encrypted. Turn on “Encrypt with password” for the backup and enter the password."
         )),
         other => anyhow!(other),
     }
@@ -107,8 +107,8 @@ pub fn describe(login: &ServerLogin) -> Result<String> {
     let repo = client.repo().map_err(explain)?;
     let snapshots = client.snapshots().map_err(explain)?;
     let mut text = tr!(
-        "Verbunden mit {} – Repository „{}“, {}, {} Sicherung(en).",
-        "Connected to {} – repository “{}”, {}, {} backup(s).",
+        "Verbunden mit {} – Tresor „{}“, {}, {} Sicherung(en).",
+        "Connected to {} – vault “{}”, {}, {} backup(s).",
         client.base_url(),
         repo.name,
         if repo.encrypted { t!("verschlüsselt", "encrypted") } else { t!("unverschlüsselt", "not encrypted") },
@@ -130,8 +130,8 @@ pub fn open(login: &ServerLogin, password: Option<&str>, rep: &Reporter) -> Resu
     let repo = client.repo().map_err(explain)?;
     if repo.encrypted && repo.key.is_none() && password.is_some() {
         rep.log(t!(
-            "Erste Sicherung in dieses Repository: Der Schlüssel wird angelegt und mit deinem Passwort geschützt.",
-            "First backup to this repository: the key is created and protected with your password."
+            "Erste Sicherung in diesen Tresor: Der Schlüssel wird angelegt und mit deinem Passwort geschützt.",
+            "First backup to this vault: the key is created and protected with your password."
         ));
     }
     let sealer = zeback_remote::open_sealer(&client, &repo, password).map_err(explain)?;
@@ -191,8 +191,8 @@ pub fn backup(job: &BackupJob, sources: &[Source], name: &str, ready: &Ready, re
     let Ready { client, repo, sealer } = ready;
     if !repo.encrypted && job.password.is_some() {
         rep.warn(tr!(
-            "„{name}“: Dieses Repository ist auf dem Server als unverschlüsselt angelegt. Das Passwort wird dort nicht verwendet.",
-            "“{name}”: this repository was created unencrypted on the server. The password is not used there."
+            "„{name}“: Dieser Tresor ist auf dem Server als unverschlüsselt angelegt. Das Passwort wird dort nicht verwendet.",
+            "“{name}”: this vault was created unencrypted on the server. The password is not used there."
         ));
     }
     let computer = computer_name();
@@ -436,8 +436,8 @@ fn open_for_reading(login: &ServerLogin, password: Option<&str>) -> Result<Ready
     let repo = client.repo().map_err(explain)?;
     if repo.encrypted && repo.key.is_none() {
         anyhow::bail!(t!(
-            "In diesem Repository liegt noch kein Schlüssel. Es enthält keine Sicherung, die sich öffnen ließe.",
-            "There is no key in this repository yet. It contains no backup that could be opened."
+            "In diesem Tresor liegt noch kein Schlüssel. Er enthält keine Sicherung, die sich öffnen ließe.",
+            "There is no key in this vault yet. It contains no backup that could be opened."
         ));
     }
     if repo.encrypted && password.is_none_or(str::is_empty) {
@@ -852,7 +852,7 @@ mod tests {
         // Ein entzogenes oder falsches Token führt zum Hinweis, neu zu koppeln.
         let stranger = ServerLogin { url: live.url.clone(), token: "falsch".into() };
         let refused = format!("{:#}", logged(|rep| backup::run(&job(&source, vec![server(&stranger)], Some(PASSWORD)), rep)).0.unwrap_err());
-        assert!(refused.contains("neu koppeln"), "{refused}");
+        assert!(refused.contains("neu verbinden"), "{refused}");
         assert!(!refused.contains("falsch"), "Token in der Meldung: {refused}");
     }
 
@@ -895,8 +895,9 @@ mod tests {
         let mut target = Target { id: 7, name: "Büro".into(), kind: TargetKind::Server, ..Target::default() };
         assert!(jobs::check_target(&target, "").unwrap_err().contains("Server-Adresse"));
         target.url = "https://backup.example.de/".into();
-        assert!(jobs::check_target(&target, "").unwrap_err().contains("noch nicht gekoppelt"));
-        assert_eq!(target.place(), "backup.example.de · noch nicht gekoppelt");
+        assert!(jobs::check_target(&target, "").unwrap_err().contains("noch nicht verbunden"));
+        assert_eq!(target.place(), "noch nicht verbunden");
+        assert_eq!(target.summary(), "ZEBack Server · noch nicht verbunden");
         target.remote_dir = "PC01".into();
         assert_eq!(target.summary(), "ZEBack Server · backup.example.de / PC01");
         assert!(target.needs_password());
@@ -910,7 +911,7 @@ mod tests {
         let Some(live) = Live::start("pruefen") else { return };
         let login = live.login("anzeige", true, 14);
         let text = describe(&login).unwrap();
-        assert!(text.contains("Repository „anzeige“") && text.contains("verschlüsselt") && text.contains("14 Tage"), "{text}");
+        assert!(text.contains("Tresor „anzeige“") && text.contains("verschlüsselt") && text.contains("14 Tage"), "{text}");
         assert!(pair(&live.url, "AAAA-BBBB-CCCC-DDDD").is_err());
     }
 

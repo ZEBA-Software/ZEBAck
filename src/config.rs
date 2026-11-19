@@ -130,8 +130,8 @@ pub struct Target {
     pub url: String,
     /// Anmeldename (SMB: optional, sonst gilt die Windows-Anmeldung); S3: Zugangsschlüssel
     pub user: String,
-    /// Nextcloud, WebDAV, S3: Ordner auf dem Server; ZEBack Server: Name des Repositorys
-    /// (trägt das Koppeln ein, nur zur Anzeige)
+    /// Nextcloud, WebDAV, S3: Ordner auf dem Server; ZEBack Server: Name des Tresors
+    /// (trägt das Verbinden ein, nur zur Anzeige)
     pub remote_dir: String,
     /// S3: Region des Buckets
     pub region: String,
@@ -155,7 +155,8 @@ impl Target {
             TargetKind::Local | TargetKind::Smb => self.path.trim().to_string(),
             _ if self.url.trim().is_empty() => t!("noch keine Adresse", "no address yet").to_string(),
             TargetKind::Server if self.remote_dir.trim().is_empty() => {
-                format!("{} · {}", crate::server::host(&self.url), t!("noch nicht gekoppelt", "not paired yet"))
+                // Kurz halten: In der Liste der Ziele steht davor schon die Art des Ziels.
+                t!("noch nicht verbunden", "not connected yet").to_string()
             }
             TargetKind::Server => format!("{} / {}", crate::server::host(&self.url), self.remote_dir.trim()),
             TargetKind::Nextcloud | TargetKind::WebDav | TargetKind::Sftp => {

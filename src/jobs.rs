@@ -49,10 +49,8 @@ pub fn check_target(target: &Target, password: &str) -> Result<(), String> {
         kind if kind.is_cloud() && target.user.trim().is_empty() => missing(t!("Der Benutzername", "The user name")),
         TargetKind::Server if target.url.trim().is_empty() => missing(t!("Die Server-Adresse", "The server address")),
         TargetKind::Server if password.is_empty() => Err(tr!(
-            "Ziel „{}“ ist noch nicht gekoppelt
-Trage unter „Sicherungsziele“ den Kopplungscode aus dem Dashboard des Servers ein und wähle „Koppeln“.",
-            "Target “{}” is not paired yet
-Under “Backup targets”, enter the pairing code from the server's dashboard and choose “Pair”.",
+            "Ziel „{}“ ist noch nicht verbunden\nTrage unter „Sicherungsziele“ den Code aus der Weboberfläche des Servers ein und wähle „Verbinden“.",
+            "Target “{}” is not connected yet\nUnder “Backup targets”, enter the code from the server's web interface and choose “Connect”.",
             target.name
         )),
         _ if target.needs_password() && password.is_empty() => missing(t!("Das Passwort", "The password")),

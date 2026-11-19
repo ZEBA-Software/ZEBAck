@@ -1116,8 +1116,8 @@ impl App {
                     return (
                         Level::Warn,
                         t!(
-                            "Gekoppelt, aber das Ziel wurde inzwischen gelöscht.",
-                            "Paired, but the target has been deleted in the meantime."
+                            "Verbunden, aber das Ziel wurde inzwischen gelöscht.",
+                            "Connected, but the target has been deleted in the meantime."
                         )
                         .to_string(),
                     );
@@ -1126,18 +1126,18 @@ impl App {
                 // Ohne gemerktes Token ließe sich das Ziel nach dem nächsten Start nicht mehr benutzen.
                 target.save_password = true;
                 let mut text = tr!(
-                    "Gekoppelt mit Repository „{}“\n{}",
-                    "Paired with repository “{}”\n{}",
+                    "Verbunden mit Tresor „{}“\n{}",
+                    "Connected to vault “{}”\n{}",
                     paired.repository,
                     if paired.encrypted {
                         t!(
-                            "Das Repository ist verschlüsselt. Schalte beim Sichern „Mit Passwort verschlüsseln“ ein – das Passwort der ersten Sicherung gilt danach für alle weiteren.",
-                            "The repository is encrypted. Turn on “Encrypt with password” when backing up – the password of the first backup then applies to all later ones."
+                            "Der Tresor ist verschlüsselt. Schalte beim Sichern „Mit Passwort verschlüsseln“ ein – das Passwort der ersten Sicherung gilt danach für alle weiteren.",
+                            "The vault is encrypted. Turn on “Encrypt with password” when backing up – the password of the first backup then applies to all later ones."
                         )
                     } else {
                         t!(
-                            "Das Repository ist unverschlüsselt: Die Dateien liegen lesbar auf dem Server.",
-                            "The repository is not encrypted: the files are stored readable on the server."
+                            "Der Tresor ist unverschlüsselt: Die Dateien liegen lesbar auf dem Server.",
+                            "The vault is not encrypted: the files are stored readable on the server."
                         )
                     }
                 );
@@ -1682,11 +1682,11 @@ impl App {
         }
         if code.is_empty() {
             return self.fail(t!(
-                "Kopplungscode fehlt\nErzeuge im Dashboard des Servers beim gewünschten Repository einen Code („Gerät koppeln“) und trage ihn hier ein.",
-                "Pairing code missing\nCreate a code in the server's dashboard for the repository you want (“Pair device”) and enter it here."
+                "Code fehlt\nErzeuge in der Weboberfläche des Servers beim gewünschten Tresor einen Code („Gerät verbinden“) und trage ihn hier ein.",
+                "Code missing\nCreate a code in the server's web interface for the vault you want (“Connect device”) and enter it here."
             ));
         }
-        self.start(t!("Koppeln mit ZEBack Server", "Pairing with ZEBack Server"), move |_| {
+        self.start(t!("Verbinden mit ZEBack Server", "Connecting to ZEBack Server"), move |_| {
             Ok(Outcome::ServerPaired(id, server::pair(&url, &code)?))
         });
     }
@@ -4824,8 +4824,8 @@ impl App {
                             widgets::text(
                                 ui,
                                 t!(
-                                    "Noch nicht gekoppelt. Erzeuge im Dashboard des Servers beim gewünschten Repository einen Kopplungscode („Gerät koppeln“) und trage ihn hier ein. Der Code gilt 15 Minuten und nur einmal.",
-                                    "Not paired yet. In the server's dashboard, create a pairing code for the repository you want (“Pair device”) and enter it here. The code is valid for 15 minutes and only once."
+                                    "Noch nicht verbunden. Erzeuge in der Weboberfläche des Servers beim gewünschten Tresor einen Code („Gerät verbinden“) und trage ihn hier ein. Der Code gilt 15 Minuten und nur einmal.",
+                                    "Not connected yet. In the server's web interface, create a code for the vault you want (“Connect device”) and enter it here. The code is valid for 15 minutes and only once."
                                 ),
                                 theme::regular(12.0),
                                 TEXT_MUTED,
@@ -4834,8 +4834,8 @@ impl App {
                             widgets::text(
                                 ui,
                                 tr!(
-                                    "Gekoppelt mit Repository „{}“. Für ein anderes Repository einen neuen Code eintragen und erneut koppeln.",
-                                    "Paired with repository “{}”. For a different repository, enter a new code and pair again.",
+                                    "Verbunden mit Tresor „{}“. Für einen anderen Tresor einen neuen Code eintragen und erneut verbinden.",
+                                    "Connected to vault “{}”. For a different vault, enter a new code and connect again.",
                                     target.remote_dir
                                 ),
                                 theme::regular(12.0),
@@ -4843,16 +4843,16 @@ impl App {
                             );
                         }
                         ui.add_space(4.0);
-                        widgets::field_label(ui, t!("Kopplungscode", "Pairing code"));
+                        widgets::field_label(ui, t!("Code", "Code"));
                         widgets::text_field(ui, "pairing_code", pairing_code, "ABCD-EFGH-JKLM-NPQR", false, width);
                         ui.add_space(6.0);
-                        pair = widgets::button(ui, t!("Koppeln", "Pair"), Kind::Primary, Some(Icon::Key)).clicked();
+                        pair = widgets::button(ui, t!("Verbinden", "Connect"), Kind::Primary, Some(Icon::Key)).clicked();
                         ui.add_space(4.0);
                         widgets::text(
                             ui,
                             t!(
-                                "Hierhin geht keine ZIP-Datei: ZEBack überträgt nur, was der Server noch nicht hat. Ob verschlüsselt wird, ist beim Repository auf dem Server festgelegt.",
-                                "No ZIP file goes here: ZEBack only transfers what the server does not have yet. Whether backups are encrypted is set for the repository on the server."
+                                "Hierhin geht keine ZIP-Datei: ZEBack überträgt nur, was der Server noch nicht hat. Ob verschlüsselt wird, ist beim Tresor auf dem Server festgelegt.",
+                                "No ZIP file goes here: ZEBack only transfers what the server does not have yet. Whether backups are encrypted is set for the vault on the server."
                             ),
                             theme::regular(12.0),
                             TEXT_MUTED,

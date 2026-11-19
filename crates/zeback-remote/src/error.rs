@@ -11,7 +11,7 @@ pub enum Error {
     Transport(String),
     #[error("Unerwartete Antwort des Servers: {0}")]
     Protocol(String),
-    #[error("Das Repository ist verschlüsselt. Es wird ein Passwort gebraucht.")]
+    #[error("Der Tresor ist verschlüsselt. Es wird ein Passwort gebraucht.")]
     PasswordRequired,
     #[error("Abgebrochen")]
     Cancelled,
