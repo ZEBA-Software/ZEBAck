@@ -54,6 +54,9 @@ new version and installs it with one click.
 - USB stick, external hard drive or a folder
 - Network share (NAS, server)
 - Nextcloud, WebDAV, S3 storage, SFTP
+- **ZEBack Server** – our own backup server with a web interface (the server itself is not
+  published yet). ZEBack only sends what the server does not have yet, so repeated backups are
+  fast and small
 
 **Automatically**
 
@@ -75,6 +78,7 @@ new version and installs it with one click.
 - ZEBack finds your backups on all targets by itself
 
 Backups of profiles and drives are ordinary ZIP files. You can get at your data even without ZEBack.
+The one exception is ZEBack Server: there, backups are stored in blocks and are restored with ZEBack.
 
 ## Getting started
 
@@ -166,7 +170,8 @@ is shown with the job.
 ZEBack ist ein Programm zum Sichern und Wiederherstellen für Windows, geschrieben in Rust. Es
 sichert Benutzerprofile, einzelne Dateien und Ordner, ganze Laufwerke und startfähige
 Systemabbilder auf USB-Laufwerke,
-Netzwerkfreigaben, Nextcloud, WebDAV, S3-Speicher und SFTP – mit Aufträgen nach Zeitplan,
+Netzwerkfreigaben, Nextcloud, WebDAV, S3-Speicher, SFTP und den eigenen ZEBack Server – mit
+Aufträgen nach Zeitplan,
 Teilsicherungen, AES-256-Verschlüsselung und Berichten per E-Mail. Die Oberfläche gibt es auf
 Deutsch und Englisch; sie startet auf Englisch, umschalten lässt sie sich mit **DE / EN** unten in
 der Seitenleiste.
@@ -211,8 +216,8 @@ creates the installers from the existing EXE files.
 2. Create a tag with the same number and push it:
 
    ```powershell
-   git tag v0.21.0
-   git push origin v0.21.0
+   git tag v0.22.0
+   git push origin v0.22.0
    ```
 
 GitHub does the rest (`.github/workflows/release.yml`): it builds both architectures, creates the
